@@ -273,12 +273,15 @@ func runDirectOnlyPairLifecycle(t *testing.T, profile tsnet.WaifusControlProfile
 	mobilityCtx, mobilityCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	waitForMobility(t, mobilityCtx, hub, servers, oldGenerations, oldDeliveries, oldPorts)
 	mobilityCancel()
-	pathCtx, pathCancel := context.WithTimeout(context.Background(), 20*time.Second)
-	waitForDirectPath(t, pathCtx, hub, servers[remoteA.Name], remoteA.Name, host.PublicNodeKey())
-	waitForDirectPath(t, pathCtx, hub, servers[remoteB.Name], remoteB.Name, host.PublicNodeKey())
-	waitForDirectPath(t, pathCtx, hub, servers[host.Name], host.Name, remoteA.PublicNodeKey())
-	waitForDirectPath(t, pathCtx, hub, servers[host.Name], host.Name, remoteB.PublicNodeKey())
-	pathCancel()
+	probeDirectPath := func(server *tsnet.Server, viewer string, peerKey key.NodePublic) {
+		pathCtx, pathCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer pathCancel()
+		waitForDirectPath(t, pathCtx, hub, server, viewer, peerKey)
+	}
+	probeDirectPath(servers[remoteA.Name], remoteA.Name, host.PublicNodeKey())
+	probeDirectPath(servers[remoteB.Name], remoteB.Name, host.PublicNodeKey())
+	probeDirectPath(servers[host.Name], host.Name, remoteA.PublicNodeKey())
+	probeDirectPath(servers[host.Name], host.Name, remoteB.PublicNodeKey())
 	assertPong(t, connectionA, "after-roam-a")
 	assertPong(t, connectionB, "after-roam-b")
 
