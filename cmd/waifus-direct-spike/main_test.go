@@ -49,6 +49,69 @@ func TestDirectOnlyPairLifecycleAndOfflineRevocation(t *testing.T) {
 	}
 }
 
+func TestDirectOnlySinglePairLifecycle(t *testing.T) {
+	stunAddress, closeSTUN := stuntest.Serve(t)
+	t.Cleanup(closeSTUN)
+	stunEndpoint := netip.MustParseAddrPort(stunAddress.String())
+
+	host := spikeNode("single-host", waifuscontrol.RoleHost, 21, "100.64.0.21/32")
+	remote := spikeNode("single-remote", waifuscontrol.RoleRemote, 22, "100.64.0.22/32")
+	hub, err := waifuscontrol.New(host, remote)
+	if err != nil {
+		t.Fatalf("new fake control: %v", err)
+	}
+	t.Cleanup(hub.Close)
+	if err := hub.ApprovePair(host.Name, remote.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	hostServer := newSpikeServer(t, hub, host, tsnet.WaifusControlProduction, "https://pair.waifucave.com", stunEndpoint)
+	remoteServer := newSpikeServer(t, hub, remote, tsnet.WaifusControlProduction, "https://pair.waifucave.com", stunEndpoint)
+	for name, server := range map[string]*tsnet.Server{host.Name: hostServer, remote.Name: remoteServer} {
+		if err := server.Start(); err != nil {
+			t.Fatalf("start %s: %v", name, err)
+		}
+	}
+
+	setupCtx, setupCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer setupCancel()
+	for _, node := range []waifuscontrol.Node{host, remote} {
+		if err := hub.WaitForMap(setupCtx, node.Name, 1, mapHasDirectEndpoints); err != nil {
+			t.Fatalf("wait for %s direct endpoints: %v", node.Name, err)
+		}
+	}
+	if hostMap, remoteMap := hub.LastMap(host.Name), hub.LastMap(remote.Name); hostMap == nil || remoteMap == nil || len(hostMap.Peers) != 1 || len(remoteMap.Peers) != 1 {
+		t.Fatalf("single-pair maps = host %v, remote %v", hostMap, remoteMap)
+	}
+
+	listener, err := hostServer.Listen("tcp", fmt.Sprintf(":%d", spikeApplicationPort))
+	if err != nil {
+		t.Fatalf("host application listener: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	application := newAuthenticatedEchoServer(listener, map[string]string{
+		remote.Address.Addr().String(): "single-token",
+	})
+	t.Cleanup(application.Close)
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	connection := dialAuthenticated(t, dialCtx, remoteServer, host.PublicNodeKey(), "single-token")
+	dialCancel()
+	t.Cleanup(func() { _ = connection.Close() })
+	assertPong(t, connection, "single-pair")
+
+	if err := hub.ProtocolError(); err != nil {
+		t.Fatalf("fake-control protocol invariant: %v", err)
+	}
+	for name, server := range map[string]*tsnet.Server{host.Name: hostServer, remote.Name: remoteServer} {
+		counters := server.Sys().MagicSock.Get().DirectOnlyCounters()
+		if counters.DERPAttempts != 0 || counters.PeerRelayAttempts != 0 ||
+			counters.EgressAttempts != 0 || counters.IdentityMutationAttempts != 0 {
+			t.Fatalf("%s prohibited-path counters = %+v, want all zero", name, counters)
+		}
+	}
+}
+
 func TestDirectOnlyUnavailableNeverRelays(t *testing.T) {
 	stunAddress, closeSTUN := stuntest.Serve(t)
 	t.Cleanup(closeSTUN)

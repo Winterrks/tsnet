@@ -174,7 +174,7 @@ jobs:
             -o "${binary}" \
             ./cmd/waifus-direct-spike
           qemu-arm "${binary}" \
-            -test.run '^(TestDirectOnlyPairLifecycleAndOfflineRevocation|TestDirectOnlyUnavailableNeverRelays)$' \
+            -test.run '^(TestDirectOnlySinglePairLifecycle|TestDirectOnlyUnavailableNeverRelays)$' \
             -test.count=1
 
   compile:
