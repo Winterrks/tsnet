@@ -84,7 +84,7 @@ jobs:
       - name: Run focused race tests
         run: go test -race ./control/controlclient ./ipn/ipnlocal ./tsnet ./wgengine/magicsock
       - name: Run direct-only race tests
-        run: go test -race -tags=waifus_direct_only ./ipn/ipnlocal ./wgengine/magicsock ./tsnet
+        run: go test -race -tags=waifus_direct_only ./ipn/ipnlocal ./wgengine ./wgengine/magicsock ./tsnet ./cmd/waifus-direct-spike ./tstest/waifuscontrol
 
   linux-feasibility:
     runs-on: ubuntu-24.04
@@ -97,19 +97,34 @@ jobs:
           go-version: "1.26.5"
           cache: true
       - name: Run tagged Linux tests
-        run: go test -tags=waifus_direct_only ./control/controlclient ./ipn/ipnlocal ./tsnet ./wgengine/...
+        run: go test -tags=waifus_direct_only ./control/controlclient ./ipn/ipnlocal ./tsnet ./wgengine/... ./cmd/waifus-direct-spike ./tstest/waifuscontrol
       - name: Audit direct-only choke points
         run: go run ./tool/waifus-direct-audit
-      - name: Run privileged feasibility matrix when present
+      - name: Install packet-matrix tools
+        run: sudo apt-get update && sudo apt-get install --yes iproute2 tcpdump
+      - name: Run privileged feasibility matrix
         shell: bash
+        env:
+          WAIFUS_SPIKE_ARTIFACT_DIR: ${{ runner.temp }}/waifus-spike
         run: |
           set -euo pipefail
-          script=./tool/waifus-spike/run-netns-matrix.sh
-          if [[ ! -x "$script" ]]; then
-            echo "Phase 2 Task 6 will add the privileged network-namespace matrix."
-            exit 0
-          fi
-          sudo -n "$script"
+          sudo -n env \
+            GOTOOLCHAIN=local \
+            GO_BINARY="$(command -v go)" \
+            GOPATH="$(go env GOPATH)" \
+            GOCACHE="$(go env GOCACHE)" \
+            GOMODCACHE="$(go env GOMODCACHE)" \
+            WAIFUS_REPOSITORY_ROOT="${GITHUB_WORKSPACE}" \
+            WAIFUS_SPIKE_ARTIFACT_DIR="${WAIFUS_SPIKE_ARTIFACT_DIR}" \
+            ./tool/waifus-spike/run-netns-matrix.sh
+      - name: Preserve packet evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: waifus-linux-packet-evidence
+          path: ${{ runner.temp }}/waifus-spike/
+          if-no-files-found: warn
+          retention-days: 14
 
   compile:
     runs-on: ubuntu-24.04
@@ -144,4 +159,30 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: "0"
-        run: go build -tags=waifus_direct_only ./control/controlclient ./ipn/ipnlocal ./tsnet ./wgengine ./wgengine/magicsock
+        run: go build -tags=waifus_direct_only ./control/controlclient ./ipn/ipnlocal ./tsnet ./wgengine ./wgengine/magicsock ./cmd/waifus-direct-spike
+      - name: Cross-compile feasibility harness
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          output_dir="${RUNNER_TEMP}/waifus-cross-build"
+          mkdir -p "${output_dir}"
+          suffix=""
+          if [[ "${GOOS}" == "windows" ]]; then
+            suffix=".exe"
+          fi
+          go test -c \
+            -tags=waifus_direct_only \
+            -o "${output_dir}/waifus-direct-spike-${GOOS}-${GOARCH}${GOARM:+-v${GOARM}}${suffix}" \
+            ./cmd/waifus-direct-spike
+      - name: Preserve cross-compiled harness
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: waifus-spike-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm }}
+          path: ${{ runner.temp }}/waifus-cross-build/
+          if-no-files-found: error
+          retention-days: 14
