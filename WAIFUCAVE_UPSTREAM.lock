@@ -1,0 +1,6 @@
+format=waifucave-upstream-lock-v1
+upstream_repository=tailscale/tailscale
+upstream_tag=v1.102.2
+upstream_commit=eb67e5dcbe145d63e1128b9b4b630f8a82da101f
+go_version=1.26.5
+reviewed_at=2026-08-23
