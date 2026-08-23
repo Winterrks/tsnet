@@ -126,6 +126,57 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  platform-smoke:
+    name: Native smoke (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: darwin-arm64
+            runner: macos-26
+          - name: windows-amd64
+            runner: windows-2025
+          - name: windows-arm64
+            runner: windows-11-arm
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install locked Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: "1.26.5"
+          cache: true
+      - name: Run native direct-only lifecycle
+        run: go test -tags=waifus_direct_only ./cmd/waifus-direct-spike ./tstest/waifuscontrol -count=1
+
+  linux-armv7-abi-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install locked Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: "1.26.5"
+          cache: true
+      - name: Install ARM userspace emulator
+        run: sudo apt-get update && sudo apt-get install --yes qemu-user
+      - name: Build and run static ARMv7 harness under QEMU
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="${RUNNER_TEMP}/waifus-direct-spike-linux-arm-v7.test"
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go test -c \
+            -tags=waifus_direct_only \
+            -o "${binary}" \
+            ./cmd/waifus-direct-spike
+          qemu-arm "${binary}" \
+            -test.run '^(TestDirectOnlyPairLifecycleAndOfflineRevocation|TestDirectOnlyUnavailableNeverRelays)$' \
+            -test.count=1
+
   compile:
     runs-on: ubuntu-24.04
     strategy:

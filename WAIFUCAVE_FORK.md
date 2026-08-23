@@ -115,6 +115,13 @@ The packet gate requires observed STUN, discovery, and encrypted direct UDP,
 and rejects outer TCP, DNS, or non-loopback egress. It cannot be closed by a
 compile-only result.
 
+Fork CI also launches the same lifecycle natively on `macos-26`
+(`darwin/arm64`), `windows-2025` (`windows/amd64`), `windows-11-arm`
+(`windows/arm64`), and `ubuntu-24.04-arm` (`linux/arm64`). Linux AMD64 runs the
+stronger namespace matrix above. A static `linux/arm/v7` harness additionally
+runs under QEMU as an ABI smoke test; that emulation is identified separately
+and does not substitute for later representative ARMv7 hardware evidence.
+
 ## Public/private boundary
 
 This public fork contains only the reusable direct-only data-plane seam and
