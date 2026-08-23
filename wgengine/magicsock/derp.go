@@ -337,6 +337,10 @@ const derpWriteQueueDepth = 32
 // It returns nil if the network is down, the Conn is closed, or the regionID is
 // not known.
 func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan derpWriteRequest {
+	if c.directOnly {
+		c.prohibitedDERPAttempts.Add(1)
+		return nil
+	}
 	if c.networkDown() {
 		return nil
 	}
@@ -709,6 +713,10 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 }
 
 func (c *connBind) receiveDERP(buffs [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+	if c.directOnly {
+		c.prohibitedDERPAttempts.Add(1)
+		return 0, net.ErrClosed
+	}
 	if s := c.Conn.health.ReceiveFuncStats(health.ReceiveDERP); s != nil {
 		s.Enter()
 		defer s.Exit()
@@ -731,6 +739,10 @@ func (c *connBind) receiveDERP(buffs [][]byte, sizes []int, eps []conn.Endpoint)
 }
 
 func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *endpoint) {
+	if c.directOnly {
+		c.prohibitedDERPAttempts.Add(1)
+		return 0, nil
+	}
 	if dm.copyBuf == nil {
 		return 0, nil
 	}
@@ -794,11 +806,12 @@ func (c *Conn) SetOnlyTCP443(v bool) {
 // SetDERPMap controls which (if any) DERP servers are used.
 // A nil value means to disable DERP; it's disabled by default.
 //
-// SetDERPMap triggers a ReSTUN after updating the map. Callers that want to
+// SetDERPMap returns [ErrDirectOnlyDERPMap] when a direct-only Conn receives a
+// non-empty map. It triggers a ReSTUN after updating an accepted map. Callers that want to
 // set the map without triggering a ReSTUN should use [Conn.SetDERPMapWithoutReSTUN]
 // instead.
-func (c *Conn) SetDERPMap(dm *tailcfg.DERPMap) {
-	c.setDERPMap(dm, true)
+func (c *Conn) SetDERPMap(dm *tailcfg.DERPMap) error {
+	return c.setDERPMap(dm, true)
 }
 
 // SetDERPMapWithoutReSTUN is like [Conn.SetDERPMap] but does not trigger a
@@ -806,11 +819,21 @@ func (c *Conn) SetDERPMap(dm *tailcfg.DERPMap) {
 //
 // It is used for setting the map from a cache, so the homeDERP can be set
 // from cache before any STUN happens.
-func (c *Conn) SetDERPMapWithoutReSTUN(dm *tailcfg.DERPMap) {
-	c.setDERPMap(dm, false)
+func (c *Conn) SetDERPMapWithoutReSTUN(dm *tailcfg.DERPMap) error {
+	return c.setDERPMap(dm, false)
 }
 
-func (c *Conn) setDERPMap(dm *tailcfg.DERPMap, doReStun bool) {
+func (c *Conn) setDERPMap(dm *tailcfg.DERPMap, doReStun bool) error {
+	if c.directOnly {
+		if dm != nil && len(dm.Regions) != 0 {
+			c.prohibitedDERPAttempts.Add(1)
+			return ErrDirectOnlyDERPMap
+		}
+		// Normalize all empty map representations to nil so wantDerpLocked can
+		// never consider DERP enabled in direct-only mode.
+		dm = nil
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -838,7 +861,7 @@ func (c *Conn) setDERPMap(dm *tailcfg.DERPMap, doReStun bool) {
 	}
 
 	if reflect.DeepEqual(dm, c.derpMap) {
-		return
+		return nil
 	}
 
 	c.derpMapAtomic.Store(dm)
@@ -846,7 +869,7 @@ func (c *Conn) setDERPMap(dm *tailcfg.DERPMap, doReStun bool) {
 	c.derpMap = dm
 	if dm == nil {
 		c.closeAllDerpLocked("derp-disabled")
-		return
+		return nil
 	}
 
 	// Reconnect any DERP region that changed definitions.
@@ -873,6 +896,7 @@ func (c *Conn) setDERPMap(dm *tailcfg.DERPMap, doReStun bool) {
 		}
 		go c.ReSTUN("derp-map-update")
 	}
+	return nil
 }
 
 func (c *Conn) wantDerpLocked() bool { return c.derpMap != nil }

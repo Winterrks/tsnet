@@ -33,6 +33,11 @@ import (
 // including synchronous calls back towards [Conn] or [endpoint] methods that
 // acquire them.
 type relayManager struct {
+	// disabled is immutable and set only during Conn construction. When true,
+	// no channels, run loop, allocation work, or relay sockets are constructed.
+	disabled           bool
+	prohibitedAttempts *atomic.Uint64
+
 	initOnce sync.Once
 
 	// hasPeerRelayServers is whether relayManager is configured with at
@@ -77,6 +82,24 @@ type relayManager struct {
 	// writers to restart it when they are blocked (see
 	// relayManagerInputEvent()).
 	runLoopStoppedCh chan struct{}
+}
+
+func (r *relayManager) disable(prohibitedAttempts *atomic.Uint64) {
+	if r.startDiscoveryCh != nil || r.runLoopStoppedCh != nil {
+		panic("disabling initialized relay manager")
+	}
+	r.disabled = true
+	r.prohibitedAttempts = prohibitedAttempts
+}
+
+func (r *relayManager) rejectDisabled() bool {
+	return r.disabled
+}
+
+func (r *relayManager) noteDisabledAttempt() {
+	if r.prohibitedAttempts != nil {
+		r.prohibitedAttempts.Add(1)
+	}
 }
 
 // serverDiscoVNI represents a [tailscale.com/net/udprelay.Server] disco key
@@ -179,6 +202,10 @@ type derpHomeChangeEvent struct {
 // handleDERPHomeChange handles a DERP home change event for nodeKey and
 // regionID.
 func (r *relayManager) handleDERPHomeChange(nodeKey key.NodePublic, regionID uint16) {
+	if r.rejectDisabled() {
+		r.noteDisabledAttempt()
+		return
+	}
 	relayManagerInputEvent(r, nil, &r.derpHomeChangeCh, derpHomeChangeEvent{
 		nodeKey:  nodeKey,
 		regionID: regionID,
@@ -272,6 +299,9 @@ func (r *relayManager) handleGetServersRunLoop(getServersCh chan set.Set[candida
 }
 
 func (r *relayManager) getServers() set.Set[candidatePeerRelay] {
+	if r.disabled {
+		return nil
+	}
 	ch := make(chan set.Set[candidatePeerRelay])
 	relayManagerInputEvent(r, nil, &r.getServersCh, ch)
 	return <-ch
@@ -436,6 +466,10 @@ func (r *relayManager) derefDiscoInfoFor(work *relayHandshakeWork) {
 // discoInfo returns a [*discoInfo] for 'serverDisco' if there is an
 // active/ongoing handshake with it, otherwise it returns nil, false.
 func (r *relayManager) discoInfo(serverDisco key.DiscoPublic) (_ *discoInfo, ok bool) {
+	if r.rejectDisabled() {
+		r.noteDisabledAttempt()
+		return nil, false
+	}
 	r.discoInfoMu.Lock()
 	defer r.discoInfoMu.Unlock()
 	di, ok := r.discoInfoByServerDisco[serverDisco]
@@ -446,6 +480,10 @@ func (r *relayManager) discoInfo(serverDisco key.DiscoPublic) (_ *discoInfo, ok 
 }
 
 func (r *relayManager) handleCallMeMaybeVia(ep *endpoint, lastBest addrQuality, lastBestIsTrusted bool, dm *disco.CallMeMaybeVia) {
+	if r.rejectDisabled() {
+		r.noteDisabledAttempt()
+		return
+	}
 	se := udprelay.ServerEndpoint{
 		ServerDisco: dm.ServerDisco,
 		ClientDisco: dm.ClientDisco,
@@ -471,6 +509,10 @@ func (r *relayManager) handleCallMeMaybeVia(ep *endpoint, lastBest addrQuality, 
 // [*disco.AllocateUDPRelayEndpointResponse] then relayServerNodeKey must be
 // nonzero.
 func (r *relayManager) handleRxDiscoMsg(conn *Conn, dm disco.Message, relayServerNodeKey key.NodePublic, discoKey key.DiscoPublic, src epAddr) {
+	if r.rejectDisabled() {
+		r.noteDisabledAttempt()
+		return
+	}
 	relayManagerInputEvent(r, nil, &r.rxDiscoMsgCh, relayDiscoMsgEvent{
 		conn:               conn,
 		msg:                dm,
@@ -484,6 +526,12 @@ func (r *relayManager) handleRxDiscoMsg(conn *Conn, dm disco.Message, relayServe
 
 // handleRelayServersSet handles an update of the complete relay server set.
 func (r *relayManager) handleRelayServersSet(servers set.Set[candidatePeerRelay]) {
+	if r.rejectDisabled() {
+		if servers.Len() != 0 {
+			r.noteDisabledAttempt()
+		}
+		return
+	}
 	relayManagerInputEvent(r, nil, &r.serversCh, servers)
 }
 
@@ -491,6 +539,10 @@ func (r *relayManager) handleRelayServersSet(servers set.Set[candidatePeerRelay]
 // [relayManager.handleRelayServersSet]: it inserts or updates a single
 // relay server entry.
 func (r *relayManager) handleRelayServerUpsert(cp candidatePeerRelay) {
+	if r.rejectDisabled() {
+		r.noteDisabledAttempt()
+		return
+	}
 	relayManagerInputEvent(r, nil, &r.serverUpsertCh, cp)
 }
 
@@ -499,6 +551,9 @@ func (r *relayManager) handleRelayServerUpsert(cp candidatePeerRelay) {
 // entry by node key. It is a no-op if nk is not currently a known relay
 // server.
 func (r *relayManager) handleRelayServerRemove(nk key.NodePublic) {
+	if r.rejectDisabled() {
+		return
+	}
 	relayManagerInputEvent(r, nil, &r.serverRemoveCh, nk)
 }
 
@@ -512,6 +567,9 @@ func (r *relayManager) handleRelayServerRemove(nk key.NodePublic) {
 // goroutine to return, i.e. the calling goroutine was birthed by runLoop and is
 // cancelable via 'ctx'. 'ctx' may be nil.
 func relayManagerInputEvent[T any](r *relayManager, ctx context.Context, eventCh *chan T, event T) {
+	if r.rejectDisabled() {
+		return
+	}
 	r.init()
 	var ctxDoneCh <-chan struct{}
 	if ctx != nil {
@@ -541,6 +599,10 @@ type endpointWithLastBest struct {
 // startUDPRelayPathDiscoveryFor starts UDP relay path discovery for ep on all
 // known relay servers if ep has no in-progress work.
 func (r *relayManager) startUDPRelayPathDiscoveryFor(ep *endpoint, lastBest addrQuality, lastBestIsTrusted bool) {
+	if r.rejectDisabled() {
+		r.noteDisabledAttempt()
+		return
+	}
 	relayManagerInputEvent(r, nil, &r.startDiscoveryCh, endpointWithLastBest{
 		ep:                ep,
 		lastBest:          lastBest,
@@ -550,6 +612,9 @@ func (r *relayManager) startUDPRelayPathDiscoveryFor(ep *endpoint, lastBest addr
 
 // stopWork stops all outstanding allocation & handshaking work for 'ep'.
 func (r *relayManager) stopWork(ep *endpoint) {
+	if r.rejectDisabled() {
+		return
+	}
 	relayManagerInputEvent(r, nil, &r.cancelWorkCh, ep)
 }
 

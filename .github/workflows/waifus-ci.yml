@@ -83,6 +83,8 @@ jobs:
           cache: true
       - name: Run focused race tests
         run: go test -race ./control/controlclient ./ipn/ipnlocal ./tsnet ./wgengine/magicsock
+      - name: Run direct-only race tests
+        run: go test -race -tags=waifus_direct_only ./wgengine/magicsock ./tsnet
 
   linux-feasibility:
     runs-on: ubuntu-24.04
@@ -96,6 +98,8 @@ jobs:
           cache: true
       - name: Run tagged Linux tests
         run: go test -tags=waifus_direct_only ./control/controlclient ./ipn/ipnlocal ./tsnet ./wgengine/...
+      - name: Audit direct-only choke points
+        run: go run ./tool/waifus-direct-audit
       - name: Run privileged feasibility matrix when present
         shell: bash
         run: |

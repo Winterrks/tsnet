@@ -110,6 +110,22 @@ type pathLabel struct {
 	Path Path
 }
 
+// DirectOnlyCounters are fail-closed regression tripwires for prohibited
+// paths. A healthy direct-only process keeps both values at zero.
+type DirectOnlyCounters struct {
+	DERPAttempts      uint64
+	PeerRelayAttempts uint64
+}
+
+// DirectOnlyCounters returns a snapshot of prohibited-path attempts observed
+// by c. The counters do not enforce policy; direct-only choke points do.
+func (c *Conn) DirectOnlyCounters() DirectOnlyCounters {
+	return DirectOnlyCounters{
+		DERPAttempts:      c.prohibitedDERPAttempts.Load(),
+		PeerRelayAttempts: c.prohibitedPeerRelayAttempts.Load(),
+	}
+}
+
 // metrics in wgengine contains the usermetrics counters for magicsock, it
 // is however a bit special. All them metrics are labeled, but looking up
 // the metric everytime we need to record it has an overhead, and includes
@@ -276,6 +292,13 @@ type Conn struct {
 
 	// usingCacheNetmap is whether the latest update to self and peersByID are from a cached network map.
 	usingCachedNetmap atomic.Bool
+
+	// directOnly is immutable after NewConn. It can be true only in a
+	// waifus_direct_only tagged build.
+	directOnly bool
+
+	prohibitedDERPAttempts      atomic.Uint64
+	prohibitedPeerRelayAttempts atomic.Uint64
 
 	// ============================================================
 	// mu guards all following fields; see userspaceEngine lock
@@ -449,6 +472,10 @@ func (c *Conn) dlogf(format string, a ...any) {
 
 // Options contains options for Listen.
 type Options struct {
+	// DirectOnly selects the immutable Waifus direct UDP/WireGuard policy.
+	// It is accepted only in a waifus_direct_only tagged build.
+	DirectOnly bool
+
 	// EventBus, if non-nil, is used for event publication and subscription by
 	// each Conn created from these Options. It must not be nil outside of
 	// tests.
@@ -609,6 +636,10 @@ func newConn(logf logger.Logf) *Conn {
 }
 
 func (c *Conn) onUDPRelayAllocResp(allocResp UDPRelayAllocResp) {
+	if c.directOnly {
+		c.prohibitedPeerRelayAttempts.Add(1)
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ep, ok := c.peerMap.endpointForNodeKey(allocResp.ReqRxFromNodeKey)
@@ -644,6 +675,8 @@ func (c *Conn) onUDPRelayAllocResp(allocResp UDPRelayAllocResp) {
 // callback opts.EndpointsFunc is called.
 func NewConn(opts Options) (*Conn, error) {
 	switch {
+	case opts.DirectOnly && !directOnlyBuild:
+		return nil, ErrDirectOnlyBuildRequired
 	case opts.NetMon == nil:
 		return nil, errors.New("magicsock.Options.NetMon must be non-nil")
 	case opts.EventBus == nil:
@@ -651,6 +684,10 @@ func NewConn(opts Options) (*Conn, error) {
 	}
 
 	c := newConn(opts.logf())
+	c.directOnly = opts.DirectOnly
+	if c.directOnly {
+		c.relayManager.disable(&c.prohibitedPeerRelayAttempts)
+	}
 	if !opts.ForceDiscoKey.IsZero() {
 		c.discoAtomic.Set(opts.ForceDiscoKey)
 	}
@@ -1528,7 +1565,28 @@ func (c *Conn) Send(buffs [][]byte, ep conn.Endpoint, offset int) (err error) {
 	return nil
 }
 
-var errConnClosed = errors.New("Conn closed")
+var (
+	// ErrDirectOnlyBuildRequired reports an attempt to construct a direct-only
+	// Conn without the waifus_direct_only build tag.
+	ErrDirectOnlyBuildRequired = errors.New("direct-only magicsock requires waifus_direct_only build tag")
+
+	// ErrNoDirectPath reports that no direct IPv4 or IPv6 peer path is
+	// currently available.
+	ErrNoDirectPath = errors.New("no direct peer path available")
+
+	// ErrDirectOnlyDERPMap reports a non-empty DERP map in direct-only mode.
+	ErrDirectOnlyDERPMap = errors.New("DERP map forbidden in direct-only mode")
+
+	// ErrDirectOnlyPeerRelay reports a peer-relay operation in direct-only
+	// mode.
+	ErrDirectOnlyPeerRelay = errors.New("peer relay forbidden in direct-only mode")
+
+	// ErrDirectOnlyRelayConfiguration reports DERP or peer-relay fields in a
+	// direct-only network map.
+	ErrDirectOnlyRelayConfiguration = errors.New("relay configuration forbidden in direct-only mode")
+
+	errConnClosed = errors.New("Conn closed")
+)
 
 var errDropDerpPacket = errors.New("too many DERP packets queued; dropping")
 
@@ -1537,6 +1595,10 @@ var errNoUDP = errors.New("no UDP available on platform")
 var errUnsupportedConnType = errors.New("unsupported connection type")
 
 func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool, err error) {
+	if c.directOnly && addr.vni.IsSet() {
+		c.prohibitedPeerRelayAttempts.Add(1)
+		return false, ErrDirectOnlyPeerRelay
+	}
 	isIPv6 := false
 	switch {
 	case addr.ap.Addr().Is4():
@@ -1564,6 +1626,10 @@ func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool,
 // sendUDP sends UDP packet b to ipp.
 // See sendAddr's docs on the return value meanings.
 func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte, isDisco bool, isGeneveEncap bool) (sent bool, err error) {
+	if c.directOnly && isGeneveEncap {
+		c.prohibitedPeerRelayAttempts.Add(1)
+		return false, ErrDirectOnlyPeerRelay
+	}
 	if runtime.GOOS == "js" {
 		return false, errNoUDP
 	}
@@ -1672,6 +1738,10 @@ func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) 
 func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, isDisco bool, isGeneveEncap bool) (sent bool, err error) {
 	if addr.Addr() != tailcfg.DerpMagicIPAddr {
 		return c.sendUDP(addr, b, isDisco, isGeneveEncap)
+	}
+	if c.directOnly {
+		c.prohibitedDERPAttempts.Add(1)
+		return false, ErrNoDirectPath
 	}
 
 	regionID := int(addr.Port())
@@ -1841,6 +1911,10 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
 
 	var geneve packet.GeneveHeader
 	pt, isGeneveEncap := packetLooksLike(b)
+	if c.directOnly && isGeneveEncap {
+		c.prohibitedPeerRelayAttempts.Add(1)
+		return nil, 0, false, false
+	}
 	src := epAddr{ap: ipp}
 	if isGeneveEncap {
 		err := geneve.Decode(b)
@@ -2892,6 +2966,9 @@ func (c *Conn) SetFilter(f *filter.Filter) {
 	relayClientEnabled := c.relayClientEnabled
 	c.mu.Unlock() // release c.mu before potentially calling c.updateRelayServersSet which is O(m * n)
 
+	if c.directOnly {
+		return
+	}
 	if !relayClientEnabled {
 		// Early return if we cannot operate as a relay client.
 		return
@@ -2934,6 +3011,10 @@ func (c *Conn) peerSnapshotLocked() []tailcfg.NodeView {
 //  2. Moving this work upstream into [nodeBackend] or similar, and publishing
 //     the computed result over the eventbus instead.
 func (c *Conn) updateRelayServersSet(filt *filter.Filter, self tailcfg.NodeView, peers []tailcfg.NodeView) {
+	if c.directOnly {
+		c.prohibitedPeerRelayAttempts.Add(1)
+		return
+	}
 	relayServers := make(set.Set[candidatePeerRelay])
 	nodes := append(peers, self)
 	for _, maybeCandidate := range nodes {
@@ -3019,22 +3100,25 @@ func (c *candidatePeerRelay) isValid() bool {
 // and [Conn.RemovePeer] methods. SetNetworkMap remains the right call for the
 // initial netmap and for changes to self or to global state (filter, DERP,
 // etc.) that aren't covered by the per-peer methods.
-func (c *Conn) SetNetworkMap(self tailcfg.NodeView, peers []tailcfg.NodeView) {
-	c.setNetworkMapInternal(self, peers, false)
+func (c *Conn) SetNetworkMap(self tailcfg.NodeView, peers []tailcfg.NodeView) error {
+	return c.setNetworkMapInternal(self, peers, false)
 }
 
 // SetNetworkMapCached behaves as SetNetworkMap, but indicates to c that the
 // data provided are from a cache rather than the control plane. The same
 // constraints otherwise apply.
-func (c *Conn) SetNetworkMapCached(self tailcfg.NodeView, peers []tailcfg.NodeView) {
-	c.setNetworkMapInternal(self, peers, true)
+func (c *Conn) SetNetworkMapCached(self tailcfg.NodeView, peers []tailcfg.NodeView) error {
+	return c.setNetworkMapInternal(self, peers, true)
 }
 
 // setNetworkMapInternal is the shared implementation of SetNetworkMap and SetNetworkMapCached.
-func (c *Conn) setNetworkMapInternal(self tailcfg.NodeView, peers []tailcfg.NodeView, isCached bool) {
+func (c *Conn) setNetworkMapInternal(self tailcfg.NodeView, peers []tailcfg.NodeView, isCached bool) error {
+	if err := c.validateDirectOnlyNodes(self, peers); err != nil {
+		return err
+	}
 	peersChanged, selfWasValid := c.updateNodes(self, peers)
 
-	relayClientEnabled := self.Valid() &&
+	relayClientEnabled := !c.directOnly && self.Valid() &&
 		!self.HasCap(tailcfg.NodeAttrDisableRelayClient) &&
 		!self.HasCap(tailcfg.NodeAttrOnlyTCP443)
 
@@ -3064,7 +3148,7 @@ func (c *Conn) setNetworkMapInternal(self tailcfg.NodeView, peers []tailcfg.Node
 	c.mu.Unlock() // release c.mu before potentially calling c.updateRelayServersSet which is O(m * n)
 
 	if isClosed {
-		return // nothing to do here, the conn is closed and the update is no longer relevant
+		return nil // nothing to do here, the conn is closed and the update is no longer relevant
 	}
 	if self.Valid() && !selfWasValid {
 		// Reaching here, we have our first "real" netmap (self is valid, and
@@ -3083,7 +3167,7 @@ func (c *Conn) setNetworkMapInternal(self tailcfg.NodeView, peers []tailcfg.Node
 		go c.ReSTUN("udp-offload-knobs-changed")
 	}
 
-	if peersChanged || relayClientChanged {
+	if !c.directOnly && (peersChanged || relayClientChanged) {
 		if !relayClientEnabled {
 			// [relayManager]'s run loop updates [relayManager.hasPeerRelayServers].
 			c.relayManager.handleRelayServersSet(nil)
@@ -3091,6 +3175,33 @@ func (c *Conn) setNetworkMapInternal(self tailcfg.NodeView, peers []tailcfg.Node
 			c.updateRelayServersSet(filt, selfView, peersSnap)
 		}
 	}
+	return nil
+}
+
+func (c *Conn) validateDirectOnlyNodes(self tailcfg.NodeView, peers []tailcfg.NodeView) error {
+	if !c.directOnly {
+		return nil
+	}
+	nodes := make([]tailcfg.NodeView, 0, len(peers)+1)
+	if self.Valid() {
+		nodes = append(nodes, self)
+	}
+	nodes = append(nodes, peers...)
+	for _, node := range nodes {
+		if !node.Valid() {
+			continue
+		}
+		if node.HomeDERP() != 0 {
+			c.prohibitedDERPAttempts.Add(1)
+			return fmt.Errorf("%w: node %d declares DERP home", ErrDirectOnlyRelayConfiguration, node.ID())
+		}
+		hostinfo := node.Hostinfo()
+		if hostinfo.Valid() && hostinfo.PeerRelay() {
+			c.prohibitedPeerRelayAttempts.Add(1)
+			return fmt.Errorf("%w: node %d advertises peer relay", ErrDirectOnlyRelayConfiguration, node.ID())
+		}
+	}
+	return nil
 }
 
 // updateNodes updates [Conn] to reflect the given self node and peers.
@@ -3304,16 +3415,19 @@ func (c *Conn) upsertPeerLocked(n tailcfg.NodeView, flags debugFlags, entriesPer
 // UpsertPeer updates the relay-server set incrementally (O(1)) when the
 // upserted peer's relay candidacy changed, rather than rebuilding the
 // whole set with [Conn.updateRelayServersSet].
-func (c *Conn) UpsertPeer(n tailcfg.NodeView) {
+func (c *Conn) UpsertPeer(n tailcfg.NodeView) error {
+	if err := c.validateDirectOnlyNodes(tailcfg.NodeView{}, []tailcfg.NodeView{n}); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return
+		return nil
 	}
 	if n.ID() == 0 {
 		c.mu.Unlock()
 		devPanicf("UpsertPeer: node with zero ID")
-		return
+		return nil
 	}
 	flags := c.debugFlagsLocked()
 	if prev, ok := c.peersByID[n.ID()]; ok && prev.Key() != n.Key() {
@@ -3345,6 +3459,7 @@ func (c *Conn) UpsertPeer(n tailcfg.NodeView) {
 			c.relayManager.handleRelayServerRemove(n.Key())
 		}
 	}
+	return nil
 }
 
 // RemovePeer removes a single peer from c. It is the efficient
@@ -3393,6 +3508,9 @@ func (c *Conn) RemovePeer(nid tailcfg.NodeID) {
 //
 // It mirrors the per-peer predicate in [Conn.updateRelayServersSet].
 func (c *Conn) relayCandidateLocked(p tailcfg.NodeView) (ok bool, cp candidatePeerRelay) {
+	if c.directOnly {
+		return false, candidatePeerRelay{}
+	}
 	if !p.Valid() {
 		return false, candidatePeerRelay{}
 	}
@@ -3499,8 +3617,11 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 		return nil, 0, errors.New("magicsock: connBind already open")
 	}
 	c.closed = false
-	fns := []conn.ReceiveFunc{c.receiveIPv4(), c.receiveIPv6(), c.receiveDERP}
-	if runtime.GOOS == "js" {
+	fns := []conn.ReceiveFunc{c.receiveIPv4(), c.receiveIPv6()}
+	if !c.directOnly {
+		fns = append(fns, c.receiveDERP)
+	}
+	if runtime.GOOS == "js" && !c.directOnly {
 		fns = []conn.ReceiveFunc{c.receiveDERP}
 	}
 	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
@@ -3535,10 +3656,12 @@ func (c *connBind) Close() error {
 	if c.closeDisco6 != nil {
 		c.closeDisco6.Close()
 	}
-	// Send an empty read result to unblock receiveDERP,
-	// which will then check connBind.Closed.
-	// connBind.Closed takes c.mu, but c.derpRecvCh is buffered.
-	c.derpRecvCh <- derpReadResult{}
+	if !c.directOnly {
+		// Send an empty read result to unblock receiveDERP,
+		// which will then check connBind.Closed.
+		// connBind.Closed takes c.mu, but c.derpRecvCh is buffered.
+		c.derpRecvCh <- derpReadResult{}
+	}
 	return nil
 }
 

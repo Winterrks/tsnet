@@ -65,8 +65,14 @@ const (
 	PeerWireGuardStateExpired PeerWireGuardState = 3
 )
 
-// ErrNoChanges is returned by Engine.Reconfig if no changes were made.
-var ErrNoChanges = errors.New("no changes made to Engine config")
+var (
+	// ErrNoChanges is returned by Engine.Reconfig if no changes were made.
+	ErrNoChanges = errors.New("no changes made to Engine config")
+
+	// ErrDirectOnlyBuildRequired reports an attempt to construct a direct-only
+	// engine without the waifus_direct_only build tag.
+	ErrDirectOnlyBuildRequired = errors.New("direct-only engine requires waifus_direct_only build tag")
+)
 
 // PeerForIP is the type returned by Engine.PeerForIP.
 type PeerForIP struct {

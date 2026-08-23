@@ -106,10 +106,18 @@ type endpoint struct {
 	relayCapable    bool // whether the node is capable of speaking via a [tailscale.com/net/udprelay.Server]
 }
 
+func (de *endpoint) isDirectOnly() bool {
+	return de.c != nil && de.c.directOnly
+}
+
 // udpRelayEndpointReady determines whether the given relay [addrQuality] should
 // be installed as de.bestAddr. It is only called by [relayManager] once it has
 // determined maybeBest is functional via [disco.Pong] reception.
 func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
+	if de.isDirectOnly() {
+		de.c.prohibitedPeerRelayAttempts.Add(1)
+		return
+	}
 	de.mu.Lock()
 	defer de.mu.Unlock()
 	now := mono.Now()
@@ -582,6 +590,15 @@ func (de *endpoint) DstToBytes() []byte  { return packIPPort(de.fakeWGAddr) }
 // TODO(val): Rewrite the addrFor*Locked() variations to share code.
 func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr epAddr, derpAddr netip.AddrPort, sendWGPing bool) {
 	udpAddr = de.bestAddr.epAddr
+	if de.isDirectOnly() {
+		if udpAddr.isDirect() {
+			return udpAddr, netip.AddrPort{}, false
+		}
+		if udpAddr.vni.IsSet() {
+			de.c.prohibitedPeerRelayAttempts.Add(1)
+		}
+		return epAddr{}, netip.AddrPort{}, false
+	}
 
 	if udpAddr.ap.IsValid() && !now.After(de.trustBestAddrUntil) {
 		return udpAddr, netip.AddrPort{}, false
@@ -674,6 +691,15 @@ func (de *endpoint) addrForPingSizeLocked(now mono.Time, size int) (udpAddr epAd
 	pathMTU := de.bestAddr.wireMTU
 	requestedMTU := pingSizeToPktLen(size, udpAddr)
 	mtuOk := requestedMTU <= pathMTU
+	if de.isDirectOnly() {
+		if udpAddr.isDirect() && mtuOk {
+			return udpAddr, netip.AddrPort{}
+		}
+		if udpAddr.vni.IsSet() {
+			de.c.prohibitedPeerRelayAttempts.Add(1)
+		}
+		return epAddr{}, netip.AddrPort{}
+	}
 
 	if udpAddr.ap.IsValid() && mtuOk {
 		if !now.After(de.trustBestAddrUntil) {
@@ -1074,6 +1100,9 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	de.mu.Unlock()
 
 	if !udpAddr.ap.IsValid() && !derpAddr.IsValid() {
+		if de.isDirectOnly() {
+			return ErrNoDirectPath
+		}
 		// Make a last ditch effort to see if we have a DERP route for them. If
 		// they contacted us over DERP and we don't know their UDP endpoints or
 		// their DERP home, we can at least assume they're reachable over the
@@ -1527,7 +1556,7 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 			What: "updateFromNode-resetLocked",
 		})
 	}
-	if n.HomeDERP() == 0 {
+	if de.isDirectOnly() || n.HomeDERP() == 0 {
 		if de.derpAddr.IsValid() {
 			de.debugUpdates.Add(EndpointChange{
 				When: time.Now(),
@@ -1551,7 +1580,7 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 
 	de.setEndpointsLocked(n.Endpoints())
 
-	de.relayCapable = capVerIsRelayCapable(n.Cap())
+	de.relayCapable = !de.isDirectOnly() && capVerIsRelayCapable(n.Cap())
 }
 
 func (de *endpoint) setEndpointsLocked(eps interface {
@@ -2105,6 +2134,10 @@ func (de *endpoint) numStopAndReset() int64 {
 // [candidatePeerRelay] DERP home changes may be missed from the perspective of
 // [relayManager].
 func (de *endpoint) setDERPHome(regionID uint16) {
+	if de.isDirectOnly() {
+		de.c.prohibitedDERPAttempts.Add(1)
+		return
+	}
 	de.mu.Lock()
 	defer de.mu.Unlock()
 	de.derpAddr = netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID))

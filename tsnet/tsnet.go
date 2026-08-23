@@ -946,6 +946,7 @@ func (s *Server) start() (reterr error) {
 	s.dialer = &tsdial.Dialer{Logf: tsLogf} // mutated below (before used)
 	s.dialer.SetBus(sys.Bus.Get())
 	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
+		DirectOnly:    s.waifusControl != nil,
 		Tun:           s.Tun,
 		EventBus:      sys.Bus.Get(),
 		ListenPort:    s.Port,

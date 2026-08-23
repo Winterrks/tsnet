@@ -167,6 +167,10 @@ type userspaceEngine struct {
 
 // Config is the engine configuration.
 type Config struct {
+	// DirectOnly selects the immutable Waifus direct UDP/WireGuard policy.
+	// It is accepted only in a waifus_direct_only tagged build.
+	DirectOnly bool
+
 	// Tun is the device used by the Engine to exchange packets with
 	// the OS.
 	// If nil, a fake Device that does nothing is used.
@@ -302,6 +306,10 @@ func NewFakeUserspaceEngine(logf logger.Logf, opts ...any) (Engine, error) {
 // NewUserspaceEngine creates the named tun device and returns a
 // Tailscale Engine running on it.
 func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) {
+	if conf.DirectOnly && !directOnlyBuild {
+		return nil, ErrDirectOnlyBuildRequired
+	}
+
 	var closePool closeOnErrorPool
 	defer closePool.closeAllIfError(&reterr)
 
@@ -421,6 +429,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		e.RequestStatus()
 	}
 	magicsockOpts := magicsock.Options{
+		DirectOnly:     conf.DirectOnly,
 		EventBus:       e.eventBus,
 		Logf:           logf,
 		Port:           conf.ListenPort,
