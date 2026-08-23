@@ -6,14 +6,19 @@
 package magicsock
 
 import (
+	"context"
 	"errors"
 	"net/netip"
+	"os"
+	"os/exec"
 	"testing"
 	"time"
 
+	"github.com/tailscale/wireguard-go/conn"
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
@@ -22,6 +27,58 @@ import (
 	"tailscale.com/util/set"
 	"tailscale.com/util/usermetric"
 )
+
+func TestDirectOnlyRequiresConfiguredSTUNEndpoint(t *testing.T) {
+	opts := directOnlyTestOptions(t)
+	opts.DirectSTUNEndpoint = netip.AddrPort{}
+	if _, err := NewConn(opts); !errors.Is(err, ErrDirectOnlySTUNEndpoint) {
+		t.Fatalf("NewConn error = %v, want %v", err, ErrDirectOnlySTUNEndpoint)
+	}
+}
+
+func TestDirectOnlySTUNUsesOnlyConfiguredDestinationWithoutDERP(t *testing.T) {
+	stunAddr, cleanup := stuntest.Serve(t)
+	t.Cleanup(cleanup)
+	stunEndpoint := netip.MustParseAddrPort(stunAddr.String())
+	opts := directOnlyTestOptions(t)
+	opts.DirectSTUNEndpoint = stunEndpoint
+	c, err := NewConn(opts)
+	if err != nil {
+		t.Fatalf("NewConn: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	receiveFuncs, _, err := c.bind.Open(0)
+	if err != nil {
+		t.Fatalf("bind.Open: %v", err)
+	}
+	go func() {
+		packets := [][]byte{make([]byte, 64<<10)}
+		sizes := make([]int, 1)
+		endpoints := make([]conn.Endpoint, 1)
+		_, _ = receiveFuncs[0](packets, sizes, endpoints)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	report, err := c.updateNetInfo(ctx)
+	if err != nil {
+		t.Fatalf("updateNetInfo: %v", err)
+	}
+	if !report.UDP {
+		t.Fatal("configured STUN endpoint did not produce a UDP report")
+	}
+	if c.derpMap != nil || c.derpMapAtomic.Load() != nil {
+		t.Fatal("direct-only STUN installed a DERP map")
+	}
+
+	forbidden := netip.AddrPortFrom(stunEndpoint.Addr(), stunEndpoint.Port()+1)
+	if _, err := c.sendUDPNetcheck([]byte("forbidden"), forbidden); !errors.Is(err, ErrDirectOnlyEgress) {
+		t.Fatalf("sendUDPNetcheck error = %v, want %v", err, ErrDirectOnlyEgress)
+	}
+	if got := c.DirectOnlyCounters().EgressAttempts; got != 1 {
+		t.Fatalf("prohibited egress attempts = %d, want 1", got)
+	}
+}
 
 func TestDirectOnlyRejectsDERPBeforeInstallOrSend(t *testing.T) {
 	c := newDirectOnlyTestConn(t)
@@ -52,6 +109,28 @@ func TestDirectOnlyRejectsDERPBeforeInstallOrSend(t *testing.T) {
 	counters := c.DirectOnlyCounters()
 	if counters.DERPAttempts != 3 {
 		t.Fatalf("DERP attempts = %d, want 3", counters.DERPAttempts)
+	}
+}
+
+func TestDirectOnlyIgnoresDebugDERPOverride(t *testing.T) {
+	if os.Getenv("WAIFUS_DEBUG_DERP_CHILD") == "" {
+		command := exec.Command(os.Args[0], "-test.run=^TestDirectOnlyIgnoresDebugDERPOverride$", "-test.count=1")
+		command.Env = append(os.Environ(),
+			"WAIFUS_DEBUG_DERP_CHILD=1",
+			"TS_DEBUG_USE_DERP_ADDR=127.0.0.1",
+			"TS_DEBUG_USE_DERP_HTTP=true",
+		)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("debug-DERP child failed: %v\n%s", err, output)
+		}
+		return
+	}
+	c := newDirectOnlyTestConn(t)
+	if err := c.SetDERPMap(nil); err != nil {
+		t.Fatalf("SetDERPMap(nil): %v", err)
+	}
+	if c.derpMap != nil || c.derpMapAtomic.Load() != nil {
+		t.Fatal("debug environment installed a DERP map in direct-only mode")
 	}
 }
 
@@ -204,6 +283,16 @@ func TestDirectOnlyDropsGeneveAtUDPIngress(t *testing.T) {
 
 func newDirectOnlyTestConn(t *testing.T) *Conn {
 	t.Helper()
+	c, err := NewConn(directOnlyTestOptions(t))
+	if err != nil {
+		t.Fatalf("NewConn: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+func directOnlyTestOptions(t *testing.T) Options {
+	t.Helper()
 	bus := eventbus.New()
 	t.Cleanup(bus.Close)
 	netMon, err := netmon.New(bus, logger.Discard)
@@ -211,8 +300,9 @@ func newDirectOnlyTestConn(t *testing.T) *Conn {
 		t.Fatalf("netmon.New: %v", err)
 	}
 	t.Cleanup(func() { netMon.Close() })
-	c, err := NewConn(Options{
+	return Options{
 		DirectOnly:             true,
+		DirectSTUNEndpoint:     netip.MustParseAddrPort("127.0.0.1:3478"),
 		DisablePortMapper:      true,
 		Logf:                   logger.Discard,
 		NetMon:                 netMon,
@@ -220,12 +310,7 @@ func newDirectOnlyTestConn(t *testing.T) *Conn {
 		HealthTracker:          health.NewTracker(bus),
 		Metrics:                new(usermetric.Registry),
 		TestOnlyPacketListener: localhostListener{},
-	})
-	if err != nil {
-		t.Fatalf("NewConn: %v", err)
 	}
-	t.Cleanup(func() { c.Close() })
-	return c
 }
 
 func directOnlyTestNode(id tailcfg.NodeID, homeDERP int, peerRelay bool, prefix string) tailcfg.NodeView {

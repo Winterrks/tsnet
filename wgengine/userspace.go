@@ -171,6 +171,10 @@ type Config struct {
 	// It is accepted only in a waifus_direct_only tagged build.
 	DirectOnly bool
 
+	// DirectSTUNEndpoint is the immutable IP-literal STUN destination passed
+	// to magicsock when DirectOnly is selected.
+	DirectSTUNEndpoint netip.AddrPort
+
 	// Tun is the device used by the Engine to exchange packets with
 	// the OS.
 	// If nil, a fake Device that does nothing is used.
@@ -429,22 +433,23 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		e.RequestStatus()
 	}
 	magicsockOpts := magicsock.Options{
-		DirectOnly:     conf.DirectOnly,
-		EventBus:       e.eventBus,
-		Logf:           logf,
-		Port:           conf.ListenPort,
-		EndpointsFunc:  endpointsFn,
-		DERPActiveFunc: e.RequestStatus,
-		IdleFunc:       e.tundev.IdleDuration,
-		NetMon:         e.netMon,
-		HealthTracker:  e.health,
-		ExtraRootCAs:   conf.ExtraRootCAs,
-		DERPAppName:    conf.DERPAppName,
-		Metrics:        conf.Metrics,
-		ControlKnobs:   conf.ControlKnobs,
-		PeerByKeyFunc:  e.PeerByKey,
-		ForceDiscoKey:  conf.ForceDiscoKey,
-		OnDERPRecv:     conf.OnDERPRecv,
+		DirectOnly:         conf.DirectOnly,
+		DirectSTUNEndpoint: conf.DirectSTUNEndpoint,
+		EventBus:           e.eventBus,
+		Logf:               logf,
+		Port:               conf.ListenPort,
+		EndpointsFunc:      endpointsFn,
+		DERPActiveFunc:     e.RequestStatus,
+		IdleFunc:           e.tundev.IdleDuration,
+		NetMon:             e.netMon,
+		HealthTracker:      e.health,
+		ExtraRootCAs:       conf.ExtraRootCAs,
+		DERPAppName:        conf.DERPAppName,
+		Metrics:            conf.Metrics,
+		ControlKnobs:       conf.ControlKnobs,
+		PeerByKeyFunc:      e.PeerByKey,
+		ForceDiscoKey:      conf.ForceDiscoKey,
+		OnDERPRecv:         conf.OnDERPRecv,
 	}
 	var err error
 	e.magicConn, err = magicsock.NewConn(magicsockOpts)

@@ -184,10 +184,12 @@ import (
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
 	"tailscale.com/types/bools"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/nettype"
@@ -212,6 +214,35 @@ var (
 	// ErrWaifusControlURLOverride reports an attempt to supply an arbitrary
 	// control URL to a Waifus-mode server.
 	ErrWaifusControlURLOverride = errors.New("Waifus control URL overrides are forbidden")
+
+	// ErrWaifusNodeRole reports a missing or unknown host/remote role.
+	ErrWaifusNodeRole = errors.New("invalid Waifus node role")
+
+	// ErrWaifusPeerAuthorizerRequired reports a missing pair approval callback.
+	ErrWaifusPeerAuthorizerRequired = errors.New("Waifus peer authorizer is required")
+
+	// ErrWaifusApplicationPort reports a missing fixed application service port.
+	ErrWaifusApplicationPort = errors.New("Waifus application port is required")
+
+	// ErrWaifusSTUNEndpoint reports a missing or unsafe immutable STUN
+	// destination.
+	ErrWaifusSTUNEndpoint = errors.New("valid Waifus STUN endpoint is required")
+
+	// ErrWaifusRuntimeConfiguration reports generic tsnet configuration that
+	// would enable credentials, routes, or services outside the Waifus helper.
+	ErrWaifusRuntimeConfiguration = errors.New("generic tsnet configuration is forbidden in Waifus mode")
+
+	// ErrWaifusOperationUnavailable reports a generic VPN, proxy, LocalAPI,
+	// Serve/Funnel, SSH, TLS, or packet-listener surface in Waifus mode.
+	ErrWaifusOperationUnavailable = errors.New("operation unavailable in Waifus mode")
+
+	// ErrWaifusApplicationListener reports an attempt to expose more than the
+	// one stable plain-TCP application listener.
+	ErrWaifusApplicationListener = errors.New("invalid Waifus application listener")
+
+	// ErrWaifusPeerUnavailable reports a dial target that is absent, revoked,
+	// malformed, or outside the current pair-isolated view.
+	ErrWaifusPeerUnavailable = errors.New("Waifus peer is unavailable")
 )
 
 // WaifusControlProfile selects one of the control-plane profiles compiled
@@ -236,17 +267,35 @@ const (
 // immutable compiled profile.
 type WaifusControlClientFactory func(WaifusControlProfile, controlclient.Options) (controlclient.Client, error)
 
+type WaifusNodeRole = ipnlocal.WaifusNodeRole
+
+const (
+	WaifusNodeRoleHost   = ipnlocal.WaifusNodeRoleHost
+	WaifusNodeRoleRemote = ipnlocal.WaifusNodeRoleRemote
+)
+
+type WaifusPeerIdentity = ipnlocal.WaifusPeerIdentity
+type WaifusPeerAuthorizer = ipnlocal.WaifusPeerAuthorizer
+
 // WaifusControlConfig enables the narrow Waifus control-client path. Profile
 // may be zero to select production. The complete config is copied before any
 // server or network initialization and cannot be changed after Start.
 type WaifusControlConfig struct {
-	Profile   WaifusControlProfile
-	NewClient WaifusControlClientFactory
+	Profile         WaifusControlProfile
+	Role            WaifusNodeRole
+	ApplicationPort uint16
+	STUNEndpoint    netip.AddrPort
+	AuthorizePeer   WaifusPeerAuthorizer
+	NewClient       WaifusControlClientFactory
 }
 
 type waifusControlSnapshot struct {
-	profile   WaifusControlProfile
-	newClient WaifusControlClientFactory
+	profile         WaifusControlProfile
+	role            WaifusNodeRole
+	applicationPort uint16
+	stunEndpoint    netip.AddrPort
+	authorizePeer   WaifusPeerAuthorizer
+	newClient       WaifusControlClientFactory
 }
 
 func (p WaifusControlProfile) controlURL() string {
@@ -420,6 +469,9 @@ type FallbackTCPHandler func(src, dst netip.AddrPort) (handler func(net.Conn), i
 // Dial connects to the address on the tailnet.
 // It will start the server if it has not been started yet.
 func (s *Server) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	if s.isWaifusMode() {
+		return nil, fmt.Errorf("%w: Dial", ErrWaifusOperationUnavailable)
+	}
 	if err := s.Start(); err != nil {
 		return nil, err
 	}
@@ -427,6 +479,30 @@ func (s *Server) Dial(ctx context.Context, network, address string) (net.Conn, e
 		return nil, err
 	}
 	return s.dialer.UserDial(ctx, network, address)
+}
+
+// DialWaifusPeer connects only to peerKey at the immutable Waifus application
+// port. Generic address, hostname, protocol, and port inputs are intentionally
+// absent.
+func (s *Server) DialWaifusPeer(ctx context.Context, peerKey key.NodePublic) (net.Conn, error) {
+	if !s.isWaifusMode() {
+		return nil, fmt.Errorf("%w: DialWaifusPeer requires Waifus mode", ErrWaifusOperationUnavailable)
+	}
+	if peerKey.IsZero() {
+		return nil, ErrWaifusPeerUnavailable
+	}
+	if err := s.Start(); err != nil {
+		return nil, err
+	}
+	if err := s.awaitRunning(ctx); err != nil {
+		return nil, err
+	}
+	address, ok := s.lb.WaifusPeerAddress(peerKey)
+	if !ok {
+		return nil, ErrWaifusPeerUnavailable
+	}
+	target := net.JoinHostPort(address.String(), strconv.Itoa(int(s.waifusControl.applicationPort)))
+	return s.dialer.UserDial(ctx, "tcp", target)
 }
 
 // awaitRunning waits until the backend is in state Running.
@@ -475,6 +551,9 @@ func (s *Server) HTTPClient() *http.Client {
 // It will start the server if it has not been started yet. If the server's
 // already been started successfully, it doesn't return an error.
 func (s *Server) LocalClient() (*local.Client, error) {
+	if s.isWaifusMode() {
+		return nil, fmt.Errorf("%w: LocalClient", ErrWaifusOperationUnavailable)
+	}
 	if err := s.Start(); err != nil {
 		return nil, err
 	}
@@ -509,6 +588,9 @@ func (testHooks) LocalBackend(s *Server) *ipnlocal.LocalBackend {
 // If you only need to use the LocalAPI from Go, then prefer LocalClient
 // as it does not require communication via TCP.
 func (s *Server) Loopback() (addr string, proxyCred, localAPICred string, err error) {
+	if s.isWaifusMode() {
+		return "", "", "", fmt.Errorf("%w: Loopback", ErrWaifusOperationUnavailable)
+	}
 	if err := s.Start(); err != nil {
 		return "", "", "", err
 	}
@@ -599,6 +681,9 @@ func (s *Server) Start() error {
 // Up connects the server to the tailnet and waits until it is running.
 // On success it returns the current status, including a Tailscale IP address.
 func (s *Server) Up(ctx context.Context) (*ipnstate.Status, error) {
+	if s.isWaifusMode() {
+		return nil, fmt.Errorf("%w: Up", ErrWaifusOperationUnavailable)
+	}
 	lc, err := s.LocalClient() // calls Start
 	if err != nil {
 		return nil, fmt.Errorf("tsnet.Up: %w", err)
@@ -765,10 +850,88 @@ func (s *Server) snapshotWaifusControl() (*waifusControlSnapshot, error) {
 	if profile != WaifusControlProduction && profile != WaifusControlStaging {
 		return nil, fmt.Errorf("%w: %d", ErrWaifusControlProfile, profile)
 	}
+	if config.Role != WaifusNodeRoleHost && config.Role != WaifusNodeRoleRemote {
+		return nil, fmt.Errorf("%w: %d", ErrWaifusNodeRole, config.Role)
+	}
+	if config.AuthorizePeer == nil {
+		return nil, ErrWaifusPeerAuthorizerRequired
+	}
+	if config.ApplicationPort == 0 {
+		return nil, ErrWaifusApplicationPort
+	}
+	if !validWaifusSTUNEndpoint(config.STUNEndpoint) {
+		return nil, ErrWaifusSTUNEndpoint
+	}
+	if reason := s.forbiddenWaifusRuntimeConfiguration(); reason != "" {
+		return nil, fmt.Errorf("%w: %s", ErrWaifusRuntimeConfiguration, reason)
+	}
 	return &waifusControlSnapshot{
-		profile:   profile,
-		newClient: config.NewClient,
+		profile:         profile,
+		role:            config.Role,
+		applicationPort: config.ApplicationPort,
+		stunEndpoint:    config.STUNEndpoint,
+		authorizePeer:   config.AuthorizePeer,
+		newClient:       config.NewClient,
 	}, nil
+}
+
+func validWaifusSTUNEndpoint(endpoint netip.AddrPort) bool {
+	address := endpoint.Addr()
+	return endpoint.IsValid() && endpoint.Port() != 0 && !address.Is4In6() &&
+		!address.IsUnspecified() && !address.IsMulticast() &&
+		address != tailcfg.DerpMagicIPAddr && !tsaddr.IsTailscaleIP(address)
+}
+
+func (s *Server) forbiddenWaifusRuntimeConfiguration() string {
+	switch {
+	case s.AuthKey != "":
+		return "AuthKey"
+	case s.ClientSecret != "":
+		return "ClientSecret"
+	case s.ClientID != "":
+		return "ClientID"
+	case s.IDToken != "":
+		return "IDToken"
+	case s.Audience != "":
+		return "Audience"
+	case s.RunWebClient:
+		return "RunWebClient"
+	case len(s.AdvertiseTags) != 0:
+		return "AdvertiseTags"
+	case s.Tun != nil:
+		return "Tun"
+	}
+	for _, variable := range []string{
+		"TS_AUTHKEY",
+		"TS_AUTH_KEY",
+		"TS_CLIENT_SECRET",
+		"TS_CLIENT_ID",
+		"TS_ID_TOKEN",
+		"TS_AUDIENCE",
+		"TSNET_FORCE_LOGIN",
+		"HTTP_PROXY",
+		"HTTPS_PROXY",
+		"ALL_PROXY",
+		"http_proxy",
+		"https_proxy",
+		"all_proxy",
+		"TS_DEBUG_PROXY_DNS",
+		"TS_DEBUG_FAKE_PROXY_AUTH",
+		"TS_DEBUG_USE_DERP_ADDR",
+		"TS_DEBUG_USE_DERP_HTTP",
+		"TS_DEBUG_ALWAYS_USE_DERP",
+		"TS_DEBUG_PRETENDPOINT",
+		"TS_DEBUG_SEND_CALLME_UNKNOWN_PEER",
+	} {
+		if os.Getenv(variable) != "" {
+			return variable
+		}
+	}
+	return ""
+}
+
+func (s *Server) isWaifusMode() bool {
+	return s.waifusControl != nil || s.WaifusControl != nil
 }
 
 // CertDomains returns the list of domains for which the server can
@@ -776,6 +939,9 @@ func (s *Server) snapshotWaifusControl() (*waifusControlSnapshot, error) {
 // Server.
 // If the server is not running, it returns nil.
 func (s *Server) CertDomains() []string {
+	if s.isWaifusMode() {
+		return nil
+	}
 	nm := s.lb.NetMapNoPeers()
 	if nm == nil {
 		return nil
@@ -945,18 +1111,23 @@ func (s *Server) start() (reterr error) {
 
 	s.dialer = &tsdial.Dialer{Logf: tsLogf} // mutated below (before used)
 	s.dialer.SetBus(sys.Bus.Get())
+	var directSTUNEndpoint netip.AddrPort
+	if s.waifusControl != nil {
+		directSTUNEndpoint = s.waifusControl.stunEndpoint
+	}
 	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
-		DirectOnly:    s.waifusControl != nil,
-		Tun:           s.Tun,
-		EventBus:      sys.Bus.Get(),
-		ListenPort:    s.Port,
-		NetMon:        s.netMon,
-		Dialer:        s.dialer,
-		SetSubsystem:  sys.Set,
-		ControlKnobs:  sys.ControlKnobs(),
-		HealthTracker: sys.HealthTracker.Get(),
-		ExtraRootCAs:  sys.ExtraRootCAs,
-		Metrics:       sys.UserMetricsRegistry(),
+		DirectOnly:         s.waifusControl != nil,
+		DirectSTUNEndpoint: directSTUNEndpoint,
+		Tun:                s.Tun,
+		EventBus:           sys.Bus.Get(),
+		ListenPort:         s.Port,
+		NetMon:             s.netMon,
+		Dialer:             s.dialer,
+		SetSubsystem:       sys.Set,
+		ControlKnobs:       sys.ControlKnobs(),
+		HealthTracker:      sys.HealthTracker.Get(),
+		ExtraRootCAs:       sys.ExtraRootCAs,
+		Metrics:            sys.UserMetricsRegistry(),
 	})
 	if err != nil {
 		return err
@@ -976,7 +1147,7 @@ func (s *Server) start() (reterr error) {
 		// Only process packets in netstack when using the default fake TUN.
 		// When a TUN is provided, let packets flow through it instead.
 		ns.ProcessLocalIPs = true
-		ns.ProcessSubnets = true
+		ns.ProcessSubnets = s.waifusControl == nil
 	} else {
 		// When using a TUN, check gVisor for registered endpoints to handle
 		// packets for tsnet listeners and outbound connection replies.
@@ -1034,6 +1205,11 @@ func (s *Server) start() (reterr error) {
 		localBackendOptions = append(localBackendOptions, ipnlocal.WithControlClientFactory(func(opts controlclient.Options) (controlclient.Client, error) {
 			return waifusControl.newClient(waifusControl.profile, opts)
 		}))
+		localBackendOptions = append(localBackendOptions, ipnlocal.WithWaifusNetworkMapPolicy(
+			waifusControl.role,
+			waifusControl.applicationPort,
+			waifusControl.authorizePeer,
+		))
 	}
 	lb, err := ipnlocal.NewLocalBackend(
 		tsLogf,
@@ -1045,7 +1221,9 @@ func (s *Server) start() (reterr error) {
 	if err != nil {
 		return fmt.Errorf("NewLocalBackend: %v", err)
 	}
-	lb.SetTCPHandlerForFunnelFlow(s.getTCPHandlerForFunnelFlow)
+	if s.waifusControl == nil {
+		lb.SetTCPHandlerForFunnelFlow(s.getTCPHandlerForFunnelFlow)
+	}
 	lb.SetVarRoot(s.rootPath)
 	s.logf("tsnet starting with hostname %q, varRoot %q", s.hostname, s.rootPath)
 	s.lb = lb
@@ -1059,9 +1237,12 @@ func (s *Server) start() (reterr error) {
 	prefs.ControlURL = s.getControlURL()
 	prefs.RunWebClient = s.RunWebClient
 	prefs.AdvertiseTags = s.AdvertiseTags
-	authKey, err := s.resolveAuthKey()
-	if err != nil {
-		return fmt.Errorf("error resolving auth key: %w", err)
+	var authKey string
+	if s.waifusControl == nil {
+		authKey, err = s.resolveAuthKey()
+		if err != nil {
+			return fmt.Errorf("error resolving auth key: %w", err)
+		}
 	}
 	err = lb.Start(ipn.Options{
 		UpdatePrefs: prefs,
@@ -1070,16 +1251,21 @@ func (s *Server) start() (reterr error) {
 	if err != nil {
 		return fmt.Errorf("starting backend: %w", err)
 	}
-	st := lb.State()
-	if st == ipn.NeedsLogin || envknob.Bool("TSNET_FORCE_LOGIN") {
-		s.logf("LocalBackend state is %v; running StartLoginInteractive...", st)
-		if err := s.lb.StartLoginInteractive(s.shutdownCtx); err != nil {
-			return fmt.Errorf("StartLoginInteractive: %w", err)
+	if s.waifusControl == nil {
+		st := lb.State()
+		if st == ipn.NeedsLogin || envknob.Bool("TSNET_FORCE_LOGIN") {
+			s.logf("LocalBackend state is %v; running StartLoginInteractive...", st)
+			if err := s.lb.StartLoginInteractive(s.shutdownCtx); err != nil {
+				return fmt.Errorf("StartLoginInteractive: %w", err)
+			}
+		} else if authKey != "" {
+			s.logf("Authkey is set; but state is %v. Ignoring authkey. Re-run with TSNET_FORCE_LOGIN=1 to force use of authkey.", st)
 		}
-	} else if authKey != "" {
-		s.logf("Authkey is set; but state is %v. Ignoring authkey. Re-run with TSNET_FORCE_LOGIN=1 to force use of authkey.", st)
+		go s.printAuthURLLoop()
 	}
-	go s.printAuthURLLoop()
+	if s.waifusControl != nil {
+		return nil
+	}
 
 	// Run the localapi handler, to allow fetching LetsEncrypt certs.
 	lah := localapi.NewHandler(localapi.HandlerConfig{
@@ -1163,6 +1349,9 @@ func (s *Server) resolveAuthKey() (string, error) {
 }
 
 func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker, tsLogf logger.Logf) error {
+	if s.waifusControl != nil {
+		return nil
+	}
 	if testenv.InTest() {
 		return nil
 	}
@@ -1402,6 +1591,9 @@ func (s *Server) Listen(network, addr string) (net.Listener, error) {
 //
 // If s has not been started yet, it will be started.
 func (s *Server) ListenSSH(addr string) (net.Listener, error) {
+	if s.isWaifusMode() {
+		return nil, fmt.Errorf("%w: ListenSSH", ErrWaifusOperationUnavailable)
+	}
 	rawLn, err := s.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -1422,6 +1614,9 @@ func (s *Server) ListenSSH(addr string) (net.Listener, error) {
 //
 // If s has not been started yet, it will be started.
 func (s *Server) ListenPacket(network, addr string) (net.PacketConn, error) {
+	if s.isWaifusMode() {
+		return nil, fmt.Errorf("%w: ListenPacket", ErrWaifusOperationUnavailable)
+	}
 	ap, err := resolveListenAddr(network, addr)
 	if err != nil {
 		return nil, err
@@ -1481,6 +1676,9 @@ func (c *udpPacketConn) Close() error {
 // It returns a TLS listener wrapping the tsnet listener.
 // It will start the server if it has not been started yet.
 func (s *Server) ListenTLS(network, addr string) (net.Listener, error) {
+	if s.isWaifusMode() {
+		return nil, fmt.Errorf("%w: ListenTLS", ErrWaifusOperationUnavailable)
+	}
 	if network != "tcp" {
 		return nil, fmt.Errorf("ListenTLS(%q, %q): only tcp is supported", network, addr)
 	}
@@ -1513,6 +1711,9 @@ func (s *Server) ListenTLS(network, addr string) (net.Listener, error) {
 //
 // The returned function can be used to deregister this callback.
 func (s *Server) RegisterFallbackTCPHandler(cb FallbackTCPHandler) func() {
+	if s.isWaifusMode() {
+		return func() {}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	hnd := s.fallbackTCPHandlers.Add(cb)
@@ -1584,6 +1785,9 @@ func FunnelTLSConfig(conf *tls.Config) FunnelOption {
 //
 // It will start the server if it has not been started yet.
 func (s *Server) ListenFunnel(network, addr string, opts ...FunnelOption) (net.Listener, error) {
+	if s.isWaifusMode() {
+		return nil, fmt.Errorf("%w: ListenFunnel", ErrWaifusOperationUnavailable)
+	}
 	if network != "tcp" {
 		return nil, fmt.Errorf("ListenFunnel(%q, %q): only tcp is supported", network, addr)
 	}
@@ -1945,6 +2149,9 @@ func (s *Server) decrementServiceAdvertisementLocked(name tailcfg.ServiceName) e
 //
 // This function will start the server if it is not already started.
 func (s *Server) ListenService(name string, mode ServiceMode) (*ServiceListener, error) {
+	if s.isWaifusMode() {
+		return nil, fmt.Errorf("%w: ListenService", ErrWaifusOperationUnavailable)
+	}
 	svcName := tailcfg.ServiceName(name)
 	if err := svcName.Validate(); err != nil {
 		return nil, err
@@ -2147,6 +2354,9 @@ func (s *Server) listen(network, addr string, lnOn listenOn) (net.Listener, erro
 	if err != nil {
 		return nil, err
 	}
+	if s.isWaifusMode() && (network != "tcp" || lnOn != listenOnTailnet || host.Addr().IsValid() || host.Port() == 0) {
+		return nil, fmt.Errorf("%w: require tcp on one stable wildcard port", ErrWaifusApplicationListener)
+	}
 	if err := s.Start(); err != nil {
 		return nil, err
 	}
@@ -2209,6 +2419,14 @@ func (s *Server) listenTCP(network string, host netip.AddrPort) (net.Listener, e
 func (s *Server) registerListener(network, addr string, host netip.AddrPort, lnOn listenOn, gonetLn net.Listener) (*listener, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.waifusControl != nil {
+		if len(s.listeners) != 0 {
+			return nil, fmt.Errorf("%w: listener already open", ErrWaifusApplicationListener)
+		}
+		if host.Port() != s.waifusControl.applicationPort {
+			return nil, fmt.Errorf("%w: port %d does not match fixed port %d", ErrWaifusApplicationListener, host.Port(), s.waifusControl.applicationPort)
+		}
+	}
 
 	// Allocate an ephemeral port for non-TUN listeners requesting port 0.
 	if host.Port() == 0 && gonetLn == nil {
@@ -2333,6 +2551,9 @@ func (s *Server) GetRootPath() string {
 // in this repository.
 // https://tailscale.com/docs/reference/troubleshooting/network-configuration/inspect-unencrypted-packets
 func (s *Server) CapturePcap(ctx context.Context, pcapFile string) error {
+	if s.isWaifusMode() {
+		return fmt.Errorf("%w: CapturePcap", ErrWaifusOperationUnavailable)
+	}
 	stream, err := s.localClient.StreamDebugCapture(ctx)
 	if err != nil {
 		return err

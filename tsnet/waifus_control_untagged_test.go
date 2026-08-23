@@ -7,6 +7,7 @@ package tsnet
 
 import (
 	"errors"
+	"net/netip"
 	"testing"
 
 	"tailscale.com/control/controlclient"
@@ -21,6 +22,10 @@ func TestWaifusControlRequiresDirectOnlyBuild(t *testing.T) {
 		Store:     new(mem.Store),
 		Ephemeral: true,
 		WaifusControl: &WaifusControlConfig{
+			Role:            WaifusNodeRoleRemote,
+			ApplicationPort: 43111,
+			STUNEndpoint:    netip.MustParseAddrPort("127.0.0.1:3478"),
+			AuthorizePeer:   func(WaifusPeerIdentity) bool { return true },
 			NewClient: func(WaifusControlProfile, controlclient.Options) (controlclient.Client, error) {
 				factoryCalls++
 				return nil, errors.New("factory must not run")

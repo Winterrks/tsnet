@@ -837,7 +837,10 @@ func (c *Conn) setDERPMap(dm *tailcfg.DERPMap, doReStun bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var derpAddr = debugUseDERPAddr()
+	var derpAddr string
+	if !c.directOnly {
+		derpAddr = debugUseDERPAddr()
+	}
 	if derpAddr != "" {
 		derpPort := 443
 		if debugUseDERPHTTP() {

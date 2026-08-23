@@ -8,6 +8,7 @@ package tsnet
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sync"
@@ -119,7 +120,8 @@ func TestWaifusControlFactoryIsPinnedForServerLifetime(t *testing.T) {
 			var profiles []WaifusControlProfile
 			var serverURLs []string
 			var replacementCalls int
-			config := &WaifusControlConfig{Profile: tt.configured}
+			config := waifusRestrictedTestConfig()
+			config.Profile = tt.configured
 			config.NewClient = func(profile WaifusControlProfile, opts controlclient.Options) (controlclient.Client, error) {
 				client := &waifusTestControl{shutdown: opts.Shutdown}
 				clients = append(clients, client)
@@ -191,6 +193,10 @@ func TestWaifusControlFactoryErrorHasNoStockFallback(t *testing.T) {
 		Store:     new(mem.Store),
 		Ephemeral: true,
 		WaifusControl: &WaifusControlConfig{
+			Role:            WaifusNodeRoleRemote,
+			ApplicationPort: waifusRestrictedApplicationPort,
+			STUNEndpoint:    netip.MustParseAddrPort("127.0.0.1:3478"),
+			AuthorizePeer:   func(WaifusPeerIdentity) bool { return true },
 			NewClient: func(WaifusControlProfile, controlclient.Options) (controlclient.Client, error) {
 				calls++
 				return nil, wantErr

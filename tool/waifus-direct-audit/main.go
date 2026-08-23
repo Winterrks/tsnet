@@ -85,6 +85,24 @@ func auditRepository(root string) []error {
 		},
 		{
 			file:   "wgengine/magicsock/magicsock.go",
+			name:   "NewConn",
+			before: "validDirectOnlySTUNEndpoint(opts.DirectSTUNEndpoint)",
+			after:  "newConn",
+		},
+		{
+			file:   "wgengine/magicsock/magicsock.go",
+			name:   "updateNetInfo",
+			before: "directOnlySTUNMap(c.directSTUNEndpoint)",
+			after:  "c.netChecker.GetReport",
+		},
+		{
+			file:   "wgengine/magicsock/magicsock.go",
+			name:   "sendUDPNetcheck",
+			before: "addr != c.directSTUNEndpoint",
+			after:  "c.pconn4.WriteToUDPAddrPort",
+		},
+		{
+			file:   "wgengine/magicsock/magicsock.go",
 			name:   "sendAddr",
 			before: "if c.directOnly",
 			after:  "derpWriteChanForRegion",
@@ -94,6 +112,12 @@ func auditRepository(root string) []error {
 			name:   "derpWriteChanForRegion",
 			before: "if c.directOnly",
 			after:  "derphttp.NewRegionClient",
+		},
+		{
+			file:   "wgengine/magicsock/derp.go",
+			name:   "setDERPMap",
+			before: "if !c.directOnly",
+			after:  "debugUseDERPAddr()",
 		},
 		{
 			file:   "wgengine/magicsock/magicsock.go",
@@ -140,8 +164,74 @@ func auditRepository(root string) []error {
 		{
 			file:   "tsnet/tsnet.go",
 			name:   "start",
-			before: "DirectOnly:    s.waifusControl != nil",
-			after:  "Tun:           s.Tun",
+			before: "DirectOnly:         s.waifusControl != nil",
+			after:  "Tun:                s.Tun",
+		},
+		{
+			file:   "ipn/ipnlocal/local.go",
+			name:   "setControlClientStatusLocked",
+			before: "b.waifusMapPolicy.Validate(st.NetMap)",
+			after:  "b.numClientStatusCalls.Add(1)",
+		},
+		{
+			file:   "ipn/ipnlocal/local.go",
+			name:   "updateFilterLocked",
+			before: "waifusPacketFilter(netMap, b.waifusMapPolicy.applicationPort)",
+			after:  "cn.PacketFilter()",
+		},
+		{
+			file:   "ipn/ipnlocal/local.go",
+			name:   "WaifusPeerAddress",
+			before: "b.waifusMapPolicy.authorizePeer(identity)",
+			after:  "return identity.Address.Addr(), true",
+		},
+		{
+			file:   "ipn/ipnlocal/local.go",
+			name:   "initPeerAPIListenerLocked",
+			before: "b.waifusRestricted",
+			after:  "peerAPIServer{",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "startLogger",
+			before: "if s.waifusControl != nil",
+			after:  "logtail.NewLogger",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "start",
+			before: "ns.ProcessSubnets = s.waifusControl == nil",
+			after:  "ns.Start(lb)",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "start",
+			before: "if s.waifusControl != nil {\n\t\treturn nil\n\t}",
+			after:  "localapi.NewHandler",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "Loopback",
+			before: "if s.isWaifusMode()",
+			after:  "socks5.Server{",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "registerListener",
+			before: "if s.waifusControl != nil",
+			after:  "s.listeners[key] = ln",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "registerListener",
+			before: "host.Port() != s.waifusControl.applicationPort",
+			after:  "s.listeners[key] = ln",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "DialWaifusPeer",
+			before: "s.lb.WaifusPeerAddress(peerKey)",
+			after:  "s.dialer.UserDial(ctx, \"tcp\", target)",
 		},
 	}
 	for _, check := range checks {

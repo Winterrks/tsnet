@@ -48,6 +48,7 @@ import (
 	"tailscale.com/net/sockopts"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/net/stun"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tstun"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
@@ -111,10 +112,11 @@ type pathLabel struct {
 }
 
 // DirectOnlyCounters are fail-closed regression tripwires for prohibited
-// paths. A healthy direct-only process keeps both values at zero.
+// paths. A healthy direct-only process keeps all values at zero.
 type DirectOnlyCounters struct {
 	DERPAttempts      uint64
 	PeerRelayAttempts uint64
+	EgressAttempts    uint64
 }
 
 // DirectOnlyCounters returns a snapshot of prohibited-path attempts observed
@@ -123,6 +125,7 @@ func (c *Conn) DirectOnlyCounters() DirectOnlyCounters {
 	return DirectOnlyCounters{
 		DERPAttempts:      c.prohibitedDERPAttempts.Load(),
 		PeerRelayAttempts: c.prohibitedPeerRelayAttempts.Load(),
+		EgressAttempts:    c.prohibitedEgressAttempts.Load(),
 	}
 }
 
@@ -295,10 +298,12 @@ type Conn struct {
 
 	// directOnly is immutable after NewConn. It can be true only in a
 	// waifus_direct_only tagged build.
-	directOnly bool
+	directOnly         bool
+	directSTUNEndpoint netip.AddrPort
 
 	prohibitedDERPAttempts      atomic.Uint64
 	prohibitedPeerRelayAttempts atomic.Uint64
+	prohibitedEgressAttempts    atomic.Uint64
 
 	// ============================================================
 	// mu guards all following fields; see userspaceEngine lock
@@ -475,6 +480,11 @@ type Options struct {
 	// DirectOnly selects the immutable Waifus direct UDP/WireGuard policy.
 	// It is accepted only in a waifus_direct_only tagged build.
 	DirectOnly bool
+
+	// DirectSTUNEndpoint is the one IP-literal STUN destination used for
+	// public endpoint discovery in DirectOnly mode. It is never installed as
+	// a DERP map and cannot be used for relay traffic.
+	DirectSTUNEndpoint netip.AddrPort
 
 	// EventBus, if non-nil, is used for event publication and subscription by
 	// each Conn created from these Options. It must not be nil outside of
@@ -677,6 +687,10 @@ func NewConn(opts Options) (*Conn, error) {
 	switch {
 	case opts.DirectOnly && !directOnlyBuild:
 		return nil, ErrDirectOnlyBuildRequired
+	case opts.DirectOnly && !validDirectOnlySTUNEndpoint(opts.DirectSTUNEndpoint):
+		return nil, ErrDirectOnlySTUNEndpoint
+	case !opts.DirectOnly && opts.DirectSTUNEndpoint.IsValid():
+		return nil, errors.New("direct STUN endpoint requires direct-only mode")
 	case opts.NetMon == nil:
 		return nil, errors.New("magicsock.Options.NetMon must be non-nil")
 	case opts.EventBus == nil:
@@ -685,6 +699,7 @@ func NewConn(opts Options) (*Conn, error) {
 
 	c := newConn(opts.logf())
 	c.directOnly = opts.DirectOnly
+	c.directSTUNEndpoint = opts.DirectSTUNEndpoint
 	if c.directOnly {
 		c.relayManager.disable(&c.prohibitedPeerRelayAttempts)
 	}
@@ -1070,6 +1085,9 @@ func (c *Conn) setNetInfoHavePortMap() {
 func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	c.mu.Lock()
 	dm := c.derpMap
+	if c.directOnly {
+		dm = directOnlySTUNMap(c.directSTUNEndpoint)
+	}
 	c.mu.Unlock()
 
 	if dm == nil || c.networkDown() {
@@ -1086,7 +1104,8 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 		// health package here, but I'd rather do that and not store
 		// the exact same state in two different places.
 		GetLastDERPActivity: c.health.GetDERPRegionReceivedTime,
-		OnlyTCP443:          c.onlyTCP443.Load(),
+		OnlySTUN:            c.directOnly,
+		OnlyTCP443:          !c.directOnly && c.onlyTCP443.Load(),
 	})
 	if err != nil {
 		return nil, err
@@ -1117,7 +1136,9 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	ni.OSHasIPv6.Set(report.OSHasIPv6)
 	ni.WorkingUDP.Set(report.UDP)
 	ni.WorkingICMPv4.Set(report.ICMPv4)
-	ni.PreferredDERP = c.maybeSetNearestDERP(report, false)
+	if !c.directOnly {
+		ni.PreferredDERP = c.maybeSetNearestDERP(report, false)
+	}
 	ni.FirewallMode = hostinfo.FirewallMode()
 
 	c.callNetInfoCallback(ni)
@@ -1585,8 +1606,52 @@ var (
 	// direct-only network map.
 	ErrDirectOnlyRelayConfiguration = errors.New("relay configuration forbidden in direct-only mode")
 
+	// ErrDirectOnlySTUNEndpoint reports a missing or unsafe immutable STUN
+	// destination in direct-only mode.
+	ErrDirectOnlySTUNEndpoint = errors.New("valid direct-only STUN endpoint is required")
+
+	// ErrDirectOnlyEgress reports an attempted direct-only network-check probe
+	// outside the immutable STUN destination.
+	ErrDirectOnlyEgress = errors.New("network destination forbidden in direct-only mode")
+
 	errConnClosed = errors.New("Conn closed")
 )
+
+func validDirectOnlySTUNEndpoint(endpoint netip.AddrPort) bool {
+	address := endpoint.Addr()
+	return endpoint.IsValid() && endpoint.Port() != 0 && !address.Is4In6() &&
+		!address.IsUnspecified() && !address.IsMulticast() &&
+		address != tailcfg.DerpMagicIPAddr && !tsaddr.IsTailscaleIP(address)
+}
+
+func directOnlySTUNMap(endpoint netip.AddrPort) *tailcfg.DERPMap {
+	ipv4, ipv6 := "none", "none"
+	if endpoint.Addr().Is4() {
+		ipv4 = endpoint.Addr().String()
+	} else {
+		ipv6 = endpoint.Addr().String()
+	}
+	const regionID = 1
+	return &tailcfg.DERPMap{
+		OmitDefaultRegions: true,
+		Regions: map[int]*tailcfg.DERPRegion{
+			regionID: {
+				RegionID:   regionID,
+				RegionCode: "waifus-stun",
+				RegionName: "Waifus STUN",
+				Nodes: []*tailcfg.DERPNode{{
+					Name:     "waifus-stun",
+					RegionID: regionID,
+					HostName: "waifus-stun" + tailcfg.DotInvalid,
+					IPv4:     ipv4,
+					IPv6:     ipv6,
+					STUNPort: int(endpoint.Port()),
+					STUNOnly: true,
+				}},
+			},
+		},
+	}
+}
 
 var errDropDerpPacket = errors.New("too many DERP packets queued; dropping")
 
@@ -1689,6 +1754,10 @@ func (c *Conn) maybeRebindOnError(err error) {
 // returns errors.ErrUnsupported if the client is explicitly configured to only
 // send data over TCP port 443 and/or we're running on wasm.
 func (c *Conn) sendUDPNetcheck(b []byte, addr netip.AddrPort) (int, error) {
+	if c.directOnly && addr != c.directSTUNEndpoint {
+		c.prohibitedEgressAttempts.Add(1)
+		return 0, ErrDirectOnlyEgress
+	}
 	if c.onlyTCP443.Load() || runtime.GOOS == "js" {
 		return 0, errors.ErrUnsupported
 	}

@@ -318,8 +318,11 @@ type LocalBackend struct {
 	conf             *conffile.Config // latest parsed config, or nil if not in declarative mode
 	pm               *profileManager  // mu guards access
 	lastFilterInputs *filterInputs
-	httpTestClient   *http.Client       // for controlclient. nil by default, used by tests.
-	ccGen            clientGen          // function for producing controlclient; lazily populated
+	httpTestClient   *http.Client // for controlclient. nil by default, used by tests.
+	ccGen            clientGen    // function for producing controlclient; lazily populated
+	waifusMapPolicy  *waifusNetworkMapValidator
+	waifusRestricted bool
+	waifusMapError   syncs.AtomicValue[error]
 	sshServer        SSHServer          // or nil, initialized lazily.
 	appConnector     *appc.AppConnector // or nil, initialized when configured.
 	// notifyCancel cancels notifications to the current SetNotifyCallback.
@@ -544,6 +547,7 @@ type LocalBackendOption interface {
 
 type localBackendOptions struct {
 	controlClientFactory ControlClientFactory
+	waifusMapPolicy      *waifusNetworkMapValidator
 }
 
 type localBackendOptionFunc func(*localBackendOptions) error
@@ -563,6 +567,23 @@ func WithControlClientFactory(factory ControlClientFactory) LocalBackendOption {
 			return errors.New("control client factory already configured")
 		}
 		opts.controlClientFactory = factory
+		return nil
+	})
+}
+
+// WithWaifusNetworkMapPolicy installs the immutable pair-only role and the
+// dynamic peer-approval callback used to reject generic tailnet state before
+// backend mutation.
+func WithWaifusNetworkMapPolicy(role WaifusNodeRole, applicationPort uint16, authorizePeer WaifusPeerAuthorizer) LocalBackendOption {
+	return localBackendOptionFunc(func(opts *localBackendOptions) error {
+		if opts.waifusMapPolicy != nil {
+			return errors.New("Waifus network map policy already configured")
+		}
+		validator, err := newWaifusNetworkMapValidator(role, applicationPort, authorizePeer)
+		if err != nil {
+			return err
+		}
+		opts.waifusMapPolicy = validator
 		return nil
 	})
 }
@@ -630,25 +651,27 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	}
 
 	b := &LocalBackend{
-		ctx:          ctx,
-		ctxCancel:    cancel,
-		logf:         logf,
-		keyLogf:      logger.LogOnChange(logf, 5*time.Minute, clock.Now),
-		statsLogf:    logger.LogOnChange(logf, 5*time.Minute, clock.Now),
-		sys:          sys,
-		polc:         sys.PolicyClientOrDefault(),
-		health:       sys.HealthTracker.Get(),
-		metrics:      m,
-		e:            e,
-		dialer:       dialer,
-		store:        store,
-		pm:           pm,
-		backendLogID: logID,
-		state:        ipn.NoState,
-		em:           newExpiryManager(logf, sys.Bus.Get()),
-		loginFlags:   loginFlags,
-		clock:        clock,
-		ccGen:        clientGen(constructorOptions.controlClientFactory),
+		ctx:              ctx,
+		ctxCancel:        cancel,
+		logf:             logf,
+		keyLogf:          logger.LogOnChange(logf, 5*time.Minute, clock.Now),
+		statsLogf:        logger.LogOnChange(logf, 5*time.Minute, clock.Now),
+		sys:              sys,
+		polc:             sys.PolicyClientOrDefault(),
+		health:           sys.HealthTracker.Get(),
+		metrics:          m,
+		e:                e,
+		dialer:           dialer,
+		store:            store,
+		pm:               pm,
+		backendLogID:     logID,
+		state:            ipn.NoState,
+		em:               newExpiryManager(logf, sys.Bus.Get()),
+		loginFlags:       loginFlags,
+		clock:            clock,
+		ccGen:            clientGen(constructorOptions.controlClientFactory),
+		waifusMapPolicy:  constructorOptions.waifusMapPolicy,
+		waifusRestricted: constructorOptions.waifusMapPolicy != nil,
 	}
 
 	sys.NoiseRoundTripper.Set(noiseRoundTripper{b})
@@ -720,7 +743,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		b.linkChange(cd)
 	}
 
-	if buildfeatures.HasPeerAPIServer {
+	if buildfeatures.HasPeerAPIServer && !b.waifusRestricted {
 		if tunWrap, ok := b.sys.Tun.GetOK(); ok {
 			tunWrap.PeerAPIPort = b.GetPeerAPIPort
 		} else {
@@ -1875,6 +1898,20 @@ func (b *LocalBackend) setControlClientStatusLocked(c controlclient.Client, st c
 			b.sendLocked(ipn.Notify{ErrMessage: &s})
 		}
 		return
+	}
+	if st.NetMap != nil && b.waifusMapPolicy != nil {
+		if err := b.waifusMapPolicy.Validate(st.NetMap); err != nil {
+			b.waifusMapError.Store(err)
+			b.logf("rejecting Waifus network map: %v", err)
+			if !b.blocked {
+				b.blockEngineUpdatesLocked(true)
+				b.stopEngineAndWaitLocked()
+			}
+			message := err.Error()
+			b.sendLocked(ipn.Notify{ErrMessage: &message})
+			return
+		}
+		b.waifusMapError.Store(nil)
 	}
 
 	// Track the number of calls
@@ -3427,7 +3464,11 @@ func (b *LocalBackend) updateFilterLocked(prefs ipn.PrefsView) {
 		for i := range addrs.Len() {
 			localNetsB.AddPrefix(addrs.At(i))
 		}
-		packetFilter = cn.PacketFilter()
+		if b.waifusRestricted {
+			packetFilter = waifusPacketFilter(netMap, b.waifusMapPolicy.applicationPort)
+		} else {
+			packetFilter = cn.PacketFilter()
+		}
 
 		if cn.unlockedNodesPermitted(packetFilter) {
 			b.health.SetUnhealthy(invalidPacketFilterWarnable, nil)
@@ -4750,7 +4791,7 @@ func (b *LocalBackend) Ping(ctx context.Context, ip netip.Addr, pingType tailcfg
 }
 
 func (b *LocalBackend) pingPeerAPI(ctx context.Context, ip netip.Addr) (peer tailcfg.NodeView, peerBase string, err error) {
-	if !buildfeatures.HasPeerAPIClient {
+	if !buildfeatures.HasPeerAPIClient || b.waifusRestricted {
 		return peer, peerBase, feature.ErrUnavailable
 	}
 	var zero tailcfg.NodeView
@@ -5628,7 +5669,7 @@ func (b *LocalBackend) setPrefsLocked(newp *ipn.Prefs) ipn.PrefsView {
 // GetPeerAPIPort returns the port number for the peerapi server
 // running on the provided IP.
 func (b *LocalBackend) GetPeerAPIPort(ip netip.Addr) (port uint16, ok bool) {
-	if !buildfeatures.HasPeerAPIServer {
+	if !buildfeatures.HasPeerAPIServer || b.waifusRestricted {
 		return 0, false
 	}
 	portInt, ok := b.peerAPIPorts.Load()[ip]
@@ -5818,6 +5859,38 @@ func extractPeerAPIPorts(services []tailcfg.Service) portPair {
 // O(N) work per call). NetMap will eventually be removed.
 func (b *LocalBackend) NetMap() *netmap.NetworkMap {
 	return b.currentNode().NetMap()
+}
+
+// WaifusNetworkMapError returns the most recent pair-policy violation. A nil
+// result means no violation is currently active.
+func (b *LocalBackend) WaifusNetworkMapError() error {
+	return b.waifusMapError.Load()
+}
+
+// WaifusPeerAddress returns the single stable userspace address for an
+// installed, currently approved peer. It never resolves arbitrary overlay
+// destinations.
+func (b *LocalBackend) WaifusPeerAddress(nodeKey key.NodePublic) (netip.Addr, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.waifusMapPolicy == nil || nodeKey.IsZero() || b.waifusMapError.Load() != nil {
+		return netip.Addr{}, false
+	}
+	nm := b.currentNode().netMapWithPeers()
+	if nm == nil {
+		return netip.Addr{}, false
+	}
+	for _, peer := range nm.Peers {
+		if peer.Key() != nodeKey {
+			continue
+		}
+		identity, err := validateWaifusNode(peer)
+		if err != nil || !b.waifusMapPolicy.authorizePeer(identity) {
+			return netip.Addr{}, false
+		}
+		return identity.Address.Addr(), true
+	}
+	return netip.Addr{}, false
 }
 
 // NetMapNoPeers returns the latest cached network map received from
@@ -6414,7 +6487,7 @@ func (b *LocalBackend) initPeerAPIListener() {
 
 // b.mu must be held.
 func (b *LocalBackend) initPeerAPIListenerLocked() {
-	if !buildfeatures.HasPeerAPIServer {
+	if !buildfeatures.HasPeerAPIServer || b.waifusRestricted {
 		return
 	}
 	b.logf("[v1] initPeerAPIListener: entered")
@@ -7034,7 +7107,9 @@ func (b *LocalBackend) resetAuthURLLocked() {
 	b.authActor = nil
 }
 
-func (b *LocalBackend) ShouldRunSSH() bool { return b.sshAtomicBool.Load() && envknob.CanSSHD() }
+func (b *LocalBackend) ShouldRunSSH() bool {
+	return !b.waifusRestricted && b.sshAtomicBool.Load() && envknob.CanSSHD()
+}
 
 // ShouldRunWebClient reports whether the web client is being run
 // within this tailscaled instance. ShouldRunWebClient is safe to
@@ -7061,7 +7136,7 @@ func (b *LocalBackend) ShouldExposeRemoteWebClient() bool {
 func (b *LocalBackend) setWebClientAtomicBoolLocked(caps set.Set[tailcfg.NodeCapability]) {
 	syncs.RequiresMutex(&b.mu)
 
-	shouldRun := !caps.Contains(tailcfg.NodeAttrDisableWebClient)
+	shouldRun := !b.waifusRestricted && !caps.Contains(tailcfg.NodeAttrDisableWebClient)
 	wasRunning := b.webClientAtomicBool.Swap(shouldRun)
 	if wasRunning && !shouldRun {
 		b.goTracker.Go(b.webClientShutdown) // stop web client
@@ -7075,7 +7150,7 @@ func (b *LocalBackend) setWebClientAtomicBoolLocked(caps set.Set[tailcfg.NodeCap
 func (b *LocalBackend) setExposeRemoteWebClientAtomicBoolLocked(prefs ipn.PrefsView) {
 	syncs.RequiresMutex(&b.mu)
 
-	if !buildfeatures.HasWebClient {
+	if !buildfeatures.HasWebClient || b.waifusRestricted {
 		return
 	}
 	shouldExpose := prefs.Valid() && prefs.RunWebClient()

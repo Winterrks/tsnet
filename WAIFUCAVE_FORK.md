@@ -41,6 +41,15 @@ LocalAPI, and unrelated Tailscale services must be structurally unavailable.
 A peer with no validated direct path receives a typed direct-unavailable
 result; the build never falls back to a relay.
 
+Waifus mode accepts only pair-isolated maps, pins node/discovery identities and
+overlay addresses for the process lifetime, synthesizes its own TCP filter for
+one immutable application port, and exposes no generic address or port dialer.
+Public endpoint discovery uses one immutable IP-literal STUN destination. The
+fork supplies that endpoint to netcheck through a transient STUN-only descriptor;
+it is never installed as a DERP map, and send-time enforcement rejects every
+other netcheck destination. LAN gateway port mapping and validated direct peer
+candidates remain available for NAT traversal and network mobility.
+
 Ordinary upstream behavior outside Waifus mode must remain unchanged. Runtime
 counters and packet ledgers are regression evidence, not the enforcement
 boundary.

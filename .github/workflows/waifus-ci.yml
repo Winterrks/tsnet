@@ -84,7 +84,7 @@ jobs:
       - name: Run focused race tests
         run: go test -race ./control/controlclient ./ipn/ipnlocal ./tsnet ./wgengine/magicsock
       - name: Run direct-only race tests
-        run: go test -race -tags=waifus_direct_only ./wgengine/magicsock ./tsnet
+        run: go test -race -tags=waifus_direct_only ./ipn/ipnlocal ./wgengine/magicsock ./tsnet
 
   linux-feasibility:
     runs-on: ubuntu-24.04
