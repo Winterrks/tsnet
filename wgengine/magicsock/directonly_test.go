@@ -145,6 +145,21 @@ func TestDirectOnlySTUNUsesOnlyConfiguredDestinationWithoutDERP(t *testing.T) {
 	}
 }
 
+func TestDirectOnlyAdvertisesLocalEndpointsWithoutSTUN(t *testing.T) {
+	t.Setenv("IN_TS_TEST", "")
+	c := newDirectOnlyTestConn(t)
+	local := []tailcfg.Endpoint{{
+		Addr: netip.MustParseAddrPort("192.0.2.10:41641"),
+		Type: tailcfg.EndpointLocal,
+	}}
+	if !c.setEndpoints(local) {
+		t.Fatal("direct-only local endpoint update was suppressed while no DERP map was installed")
+	}
+	if len(c.lastEndpoints) != 1 || c.lastEndpoints[0] != local[0] {
+		t.Fatalf("stored endpoints = %v, want %v", c.lastEndpoints, local)
+	}
+}
+
 func TestDirectOnlyRebindToNewPortPreservesRandomPortPolicy(t *testing.T) {
 	c := newDirectOnlyTestConn(t)
 	if _, _, err := c.bind.Open(0); err != nil {

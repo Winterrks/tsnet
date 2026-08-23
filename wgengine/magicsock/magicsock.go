@@ -1037,7 +1037,7 @@ func (c *Conn) setEndpoints(endpoints []tailcfg.Endpoint) (changed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if !anySTUN && c.derpMap == nil && !inTest() {
+	if !c.directOnly && !anySTUN && c.derpMap == nil && !inTest() {
 		// Don't bother storing or reporting this yet. We
 		// don't have a DERP map or any STUN entries, so we're
 		// just starting up. A DERP map should arrive shortly
@@ -1045,8 +1045,10 @@ func (c *Conn) setEndpoints(endpoints []tailcfg.Endpoint) (changed bool) {
 		// report. This saves a map update.
 		// TODO(bradfitz): this optimization is currently
 		// skipped during the e2e tests because they depend
-		// too much on the exact sequence of updates.  Fix the
-		// tests. But a protocol rewrite might happen first.
+		// too much on the exact sequence of updates. Direct-only
+		// connections never install a DERP map, so they must publish
+		// local candidates even when STUN has not produced a public
+		// one. Fix the tests. But a protocol rewrite might happen first.
 		c.dlogf("[v1] magicsock: ignoring pre-DERP map, STUN-less endpoint update: %v", endpoints)
 		return false
 	}

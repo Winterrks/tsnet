@@ -70,6 +70,7 @@ type nodeState struct {
 // LocalBackend observer while holding its own mutex. That is required because
 // LocalBackend invokes Client methods while holding its mutex.
 type Hub struct {
+	publishMu   sync.Mutex
 	mu          sync.Mutex
 	nodes       map[string]*nodeState
 	allowed     map[string]map[string]bool
@@ -196,6 +197,11 @@ func (h *Hub) Authorizer(viewer string) ipnlocal.WaifusPeerAuthorizer {
 // SetConnected controls only map publication. Clients and their existing
 // direct paths remain alive while false.
 func (h *Hub) SetConnected(connected bool) {
+	// Serialize the transition with map delivery so that disconnecting is
+	// linearizable: once this method returns, no snapshot created before the
+	// transition can still reach a client.
+	h.publishMu.Lock()
+	defer h.publishMu.Unlock()
 	h.mu.Lock()
 	h.connected = connected
 	h.mu.Unlock()
@@ -398,6 +404,8 @@ type delivery struct {
 }
 
 func (h *Hub) publish() {
+	h.publishMu.Lock()
+	defer h.publishMu.Unlock()
 	h.mu.Lock()
 	if !h.connected {
 		h.mu.Unlock()
