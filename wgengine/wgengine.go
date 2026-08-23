@@ -72,6 +72,10 @@ var (
 	// ErrDirectOnlyBuildRequired reports an attempt to construct a direct-only
 	// engine without the waifus_direct_only build tag.
 	ErrDirectOnlyBuildRequired = errors.New("direct-only engine requires waifus_direct_only build tag")
+
+	// ErrDirectOnlyNodeKey reports a missing or replacement helper-owned
+	// WireGuard identity in direct-only mode.
+	ErrDirectOnlyNodeKey = errors.New("direct-only node key is required and immutable")
 )
 
 // PeerForIP is the type returned by Engine.PeerForIP.

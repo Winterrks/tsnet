@@ -548,6 +548,7 @@ type LocalBackendOption interface {
 type localBackendOptions struct {
 	controlClientFactory ControlClientFactory
 	waifusMapPolicy      *waifusNetworkMapValidator
+	waifusInitialPersist *persist.Persist
 }
 
 type localBackendOptionFunc func(*localBackendOptions) error
@@ -571,19 +572,44 @@ func WithControlClientFactory(factory ControlClientFactory) LocalBackendOption {
 	})
 }
 
-// WithWaifusNetworkMapPolicy installs the immutable pair-only role and the
-// dynamic peer-approval callback used to reject generic tailnet state before
-// backend mutation.
-func WithWaifusNetworkMapPolicy(role WaifusNodeRole, applicationPort uint16, authorizePeer WaifusPeerAuthorizer) LocalBackendOption {
+// WithWaifusNetworkMapPolicy installs the immutable pair-only role, local
+// transport identity, and dynamic peer-approval callback used to reject
+// generic tailnet state before backend mutation.
+func WithWaifusNetworkMapPolicy(
+	role WaifusNodeRole,
+	applicationPort uint16,
+	selfNodeKey key.NodePublic,
+	selfDiscoKey key.DiscoPublic,
+	authorizePeer WaifusPeerAuthorizer,
+) LocalBackendOption {
 	return localBackendOptionFunc(func(opts *localBackendOptions) error {
 		if opts.waifusMapPolicy != nil {
 			return errors.New("Waifus network map policy already configured")
 		}
-		validator, err := newWaifusNetworkMapValidator(role, applicationPort, authorizePeer)
+		validator, err := newWaifusNetworkMapValidator(role, applicationPort, selfNodeKey, selfDiscoKey, authorizePeer)
 		if err != nil {
 			return err
 		}
 		opts.waifusMapPolicy = validator
+		return nil
+	})
+}
+
+// WithWaifusLocalIdentity supplies the helper-owned, non-rotating local node
+// identity. It is copied at construction, compared with any stored identity,
+// and never generated or replaced by LocalBackend.
+func WithWaifusLocalIdentity(privateNodeKey key.NodePrivate, stableNodeID tailcfg.StableNodeID) LocalBackendOption {
+	return localBackendOptionFunc(func(opts *localBackendOptions) error {
+		if privateNodeKey.IsZero() || stableNodeID == "" {
+			return fmt.Errorf("%w: missing helper-owned local identity", ErrWaifusRepairRequired)
+		}
+		if opts.waifusInitialPersist != nil {
+			return errors.New("Waifus local identity already configured")
+		}
+		opts.waifusInitialPersist = &persist.Persist{
+			PrivateNodeKey: privateNodeKey,
+			NodeID:         stableNodeID,
+		}
 		return nil
 	})
 }
@@ -604,6 +630,15 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 			return nil, fmt.Errorf("applying LocalBackend option: %w", err)
 		}
 	}
+	if constructorOptions.waifusMapPolicy != nil {
+		identity := constructorOptions.waifusInitialPersist
+		if identity == nil || identity.PrivateNodeKey.Public() != constructorOptions.waifusMapPolicy.selfNodeKey {
+			return nil, fmt.Errorf("%w: local node key does not match the Waifus map policy", ErrWaifusRepairRequired)
+		}
+		constructorOptions.waifusMapPolicy.privateNodeKey = identity.PrivateNodeKey
+	} else if constructorOptions.waifusInitialPersist != nil {
+		return nil, fmt.Errorf("%w: local identity requires a Waifus map policy", ErrWaifusNetworkMapPolicy)
+	}
 
 	e := sys.Engine.Get()
 	store := sys.StateStore.Get()
@@ -623,6 +658,19 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	pm, err := newProfileManagerWithGOOS(store, logf, sys.HealthTracker.Get(), goos)
 	if err != nil {
 		return nil, err
+	}
+	if identity := constructorOptions.waifusInitialPersist; identity != nil {
+		prefs := pm.CurrentPrefs().AsStruct()
+		initialize, err := validateWaifusStoredIdentity(prefs.Persist, identity)
+		if err != nil {
+			return nil, err
+		}
+		if initialize {
+			prefs.Persist = identity.Clone()
+			if err := pm.setPrefsNoPermCheck(prefs.View()); err != nil {
+				return nil, fmt.Errorf("initialize Waifus local identity: %w", err)
+			}
+		}
 	}
 	if sds, ok := store.(ipn.StateStoreDialerSetter); ok {
 		sds.SetDialer(dialer.SystemDial)
@@ -1899,10 +1947,16 @@ func (b *LocalBackend) setControlClientStatusLocked(c controlclient.Client, st c
 		}
 		return
 	}
-	if st.NetMap != nil && b.waifusMapPolicy != nil {
-		if err := b.waifusMapPolicy.Validate(st.NetMap); err != nil {
+	if b.waifusMapPolicy != nil {
+		if err := b.waifusMapPolicy.ValidateControlStatus(
+			st.NetMap,
+			st.Persist,
+			b.pm.CurrentPrefs().Persist(),
+			st.URL,
+			st.LoggedIn,
+		); err != nil {
 			b.waifusMapError.Store(err)
-			b.logf("rejecting Waifus network map: %v", err)
+			b.logf("rejecting Waifus control status: %v", err)
 			if !b.blocked {
 				b.blockEngineUpdatesLocked(true)
 				b.stopEngineAndWaitLocked()
@@ -2200,6 +2254,10 @@ func (b *LocalBackend) setControlClientStatusLocked(c controlclient.Client, st c
 // so the netmap update carrying the same change need not reset the peer's
 // WireGuard session. It implements [controlclient.DiscoKeyUpdater].
 func (b *LocalBackend) PatchDiscoKey(pub key.NodePublic, disco key.DiscoPublic) {
+	if b.waifusRestricted {
+		b.logf("rejecting out-of-band discovery-key update in Waifus mode")
+		return
+	}
 	b.currentNode().recordTSMPLearnedDisco(pub, disco)
 }
 
@@ -2499,6 +2557,10 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.waifusRestricted {
+		b.logf("rejecting incremental network-map update in Waifus mode")
+		return false
+	}
 
 	cn := b.currentNode()
 	// Filter the mutations through tailnet lock before applying them.
@@ -2717,6 +2779,10 @@ func (b *LocalBackend) UpdatePacketFilter(rules views.Slice[tailcfg.FilterRule],
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.waifusRestricted {
+		b.logf("rejecting incremental packet-filter update in Waifus mode")
+		return false
+	}
 	cn := b.currentNode()
 	if cn.NetMap() == nil {
 		// No netmap installed yet; the initial full-netmap path will
@@ -2758,6 +2824,10 @@ func (b *LocalBackend) UpdateUserProfiles(profiles map[tailcfg.UserID]tailcfg.Us
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.waifusRestricted {
+		b.logf("rejecting incremental user-profile update in Waifus mode")
+		return false
+	}
 	cn := b.currentNode()
 	if cn.NetMap() == nil {
 		// No netmap installed yet; the initial full-netmap path will
@@ -5891,6 +5961,80 @@ func (b *LocalBackend) WaifusPeerAddress(nodeKey key.NodePublic) (netip.Addr, bo
 		return identity.Address.Addr(), true
 	}
 	return netip.Addr{}, false
+}
+
+// WaifusPeerKeyForAddress resolves only an installed, currently approved peer
+// address. It is used to bind accepted application streams to the exact pair
+// identity so local revocation can close them immediately.
+func (b *LocalBackend) WaifusPeerKeyForAddress(address netip.Addr) (key.NodePublic, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.waifusMapPolicy == nil || !address.IsValid() || b.waifusMapError.Load() != nil {
+		return key.NodePublic{}, false
+	}
+	nm := b.currentNode().netMapWithPeers()
+	if nm == nil {
+		return key.NodePublic{}, false
+	}
+	for _, peer := range nm.Peers {
+		identity, err := validateWaifusNode(peer)
+		if err != nil || identity.Address.Addr() != address {
+			continue
+		}
+		if !b.waifusMapPolicy.authorizePeer(identity) {
+			return key.NodePublic{}, false
+		}
+		return identity.NodeKey, true
+	}
+	return key.NodePublic{}, false
+}
+
+// RefreshWaifusPeerAuthorizations immediately removes installed peers that
+// are no longer accepted by the immutable Waifus authorizer. It uses only
+// local state and therefore remains authoritative while coordination is
+// disconnected. The returned count is the number of removed peers.
+func (b *LocalBackend) RefreshWaifusPeerAuthorizations() (int, error) {
+	defer b.CheckDeadlocks()()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.waifusMapPolicy == nil {
+		return 0, ErrWaifusNetworkMapPolicy
+	}
+	if err := b.waifusMapError.Load(); err != nil {
+		return 0, err
+	}
+	nm := b.currentNode().netMapWithPeers()
+	if nm == nil {
+		return 0, nil
+	}
+	peers := make([]tailcfg.NodeView, 0, len(nm.Peers))
+	removed := 0
+	for _, peer := range nm.Peers {
+		identity, err := validateWaifusNode(peer)
+		if err != nil {
+			return 0, fmt.Errorf("%w: installed peer: %v", ErrWaifusNetworkMap, err)
+		}
+		if !b.waifusMapPolicy.authorizePeer(identity) {
+			removed++
+			continue
+		}
+		peers = append(peers, peer)
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+	nm.Peers = peers
+	b.setControlClientStatusLocked(b.cc, controlclient.Status{
+		LoggedIn:  true,
+		InMapPoll: true,
+		NetMap:    nm,
+		Persist:   b.pm.CurrentPrefs().Persist(),
+	})
+	if err := b.waifusMapError.Load(); err != nil {
+		return 0, err
+	}
+	return removed, nil
 }
 
 // NetMapNoPeers returns the latest cached network map received from

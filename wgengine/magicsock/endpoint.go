@@ -1579,6 +1579,14 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 	}
 
 	de.setEndpointsLocked(n.Endpoints())
+	if de.isDirectOnly() {
+		// A direct-only peer has no DERP channel over which to exchange a
+		// CallMeMaybe after the first application packet. Treat each full map
+		// delivery as the rendezvous signal instead: immediately probe every
+		// newly advertised direct endpoint. sendDiscoPingsLocked rate-limits
+		// endpoints already probed by an unchanged map.
+		de.sendDiscoPingsLocked(mono.Now(), false)
+	}
 
 	de.relayCapable = !de.isDirectOnly() && capVerIsRelayCapable(n.Cap())
 }

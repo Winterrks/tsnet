@@ -78,6 +78,12 @@ func auditRepository(root string) []error {
 			after:  "magicsock.NewConn",
 		},
 		{
+			file:   "wgengine/userspace.go",
+			name:   "Reconfig",
+			before: "cfg.PrivateKey.Equal(e.directOnlyNodeKey)",
+			after:  "e.tundev.SetWGConfig(cfg)",
+		},
+		{
 			file:   "wgengine/magicsock/magicsock.go",
 			name:   "NewConn",
 			before: "opts.DirectOnly && !directOnlyBuild",
@@ -88,6 +94,30 @@ func auditRepository(root string) []error {
 			name:   "NewConn",
 			before: "validDirectOnlySTUNEndpoint(opts.DirectSTUNEndpoint)",
 			after:  "newConn",
+		},
+		{
+			file:   "wgengine/magicsock/magicsock.go",
+			name:   "NewConn",
+			before: "opts.ForceDiscoKey.IsZero()",
+			after:  "newConn",
+		},
+		{
+			file:   "wgengine/magicsock/magicsock.go",
+			name:   "NewConn",
+			before: "opts.ForceNodeKey.IsZero()",
+			after:  "newConn",
+		},
+		{
+			file:   "wgengine/magicsock/magicsock.go",
+			name:   "SetPrivateKey",
+			before: "privateKey.Equal(c.directOnlyNodeKey)",
+			after:  "c.privateKey = newKey",
+		},
+		{
+			file:   "wgengine/magicsock/magicsock.go",
+			name:   "RotateDiscoKey",
+			before: "if c.directOnly",
+			after:  "key.NewDisco()",
 		},
 		{
 			file:   "wgengine/magicsock/magicsock.go",
@@ -168,10 +198,58 @@ func auditRepository(root string) []error {
 			after:  "Tun:                s.Tun",
 		},
 		{
+			file:   "tsnet/tsnet.go",
+			name:   "start",
+			before: "ForceNodeKey:       forceNodeKey",
+			after:  "ForceDiscoKey:      forceDiscoKey",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "start",
+			before: "ForceDiscoKey:      forceDiscoKey",
+			after:  "Tun:                s.Tun",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "start",
+			before: "ipnlocal.WithWaifusLocalIdentity(",
+			after:  "ipnlocal.NewLocalBackend(",
+		},
+		{
+			file:   "ipn/ipnlocal/local.go",
+			name:   "NewLocalBackend",
+			before: "validateWaifusStoredIdentity(prefs.Persist, identity)",
+			after:  "prefs.Persist = identity.Clone()",
+		},
+		{
 			file:   "ipn/ipnlocal/local.go",
 			name:   "setControlClientStatusLocked",
-			before: "b.waifusMapPolicy.Validate(st.NetMap)",
+			before: "b.waifusMapPolicy.ValidateControlStatus(",
 			after:  "b.numClientStatusCalls.Add(1)",
+		},
+		{
+			file:   "ipn/ipnlocal/local.go",
+			name:   "UpdateNetmapDelta",
+			before: "if b.waifusRestricted",
+			after:  "cn.UpdateNetmapDelta(muts)",
+		},
+		{
+			file:   "ipn/ipnlocal/local.go",
+			name:   "UpdatePacketFilter",
+			before: "if b.waifusRestricted",
+			after:  "cn.setPacketFilter(rules, parsed)",
+		},
+		{
+			file:   "ipn/ipnlocal/local.go",
+			name:   "UpdateUserProfiles",
+			before: "if b.waifusRestricted",
+			after:  "cn.mergeUserProfiles(profiles)",
+		},
+		{
+			file:   "ipn/ipnlocal/local.go",
+			name:   "PatchDiscoKey",
+			before: "if b.waifusRestricted",
+			after:  "recordTSMPLearnedDisco(pub, disco)",
 		},
 		{
 			file:   "ipn/ipnlocal/local.go",
@@ -184,6 +262,18 @@ func auditRepository(root string) []error {
 			name:   "WaifusPeerAddress",
 			before: "b.waifusMapPolicy.authorizePeer(identity)",
 			after:  "return identity.Address.Addr(), true",
+		},
+		{
+			file:   "ipn/ipnlocal/local.go",
+			name:   "WaifusPeerKeyForAddress",
+			before: "b.waifusMapPolicy.authorizePeer(identity)",
+			after:  "return identity.NodeKey, true",
+		},
+		{
+			file:   "ipn/ipnlocal/local.go",
+			name:   "RefreshWaifusPeerAuthorizations",
+			before: "b.waifusMapPolicy.authorizePeer(identity)",
+			after:  "b.setControlClientStatusLocked(",
 		},
 		{
 			file:   "ipn/ipnlocal/local.go",
@@ -232,6 +322,30 @@ func auditRepository(root string) []error {
 			name:   "DialWaifusPeer",
 			before: "s.lb.WaifusPeerAddress(peerKey)",
 			after:  "s.dialer.UserDial(ctx, \"tcp\", target)",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "DialWaifusPeer",
+			before: "s.dialer.UserDial(ctx, \"tcp\", target)",
+			after:  "s.trackWaifusConnection(peerKey, connection)",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "RefreshWaifusPeerAuthorizations",
+			before: "s.closeUnauthorizedWaifusConnections()",
+			after:  "s.lb.RefreshWaifusPeerAuthorizations()",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "getTCPHandlerForFlow",
+			before: "s.lb.WaifusPeerKeyForAddress(src.Addr())",
+			after:  "ln.handle(s.trackWaifusConnection(peerKey, connection))",
+		},
+		{
+			file:   "tsnet/tsnet.go",
+			name:   "trackWaifusConnection",
+			before: "s.lb.WaifusPeerAddress(peerKey)",
+			after:  "return tracked",
 		},
 	}
 	for _, check := range checks {

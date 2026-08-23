@@ -54,6 +54,17 @@ func TestWaifusControlRequiresRoleAndPeerAuthorizer(t *testing.T) {
 	if err := s.Start(); !errors.Is(err, ErrWaifusSTUNEndpoint) {
 		t.Fatalf("missing STUN endpoint error = %v, want %v", err, ErrWaifusSTUNEndpoint)
 	}
+
+	s = &Server{WaifusControl: &WaifusControlConfig{
+		Role:            WaifusNodeRoleRemote,
+		ApplicationPort: waifusRestrictedApplicationPort,
+		STUNEndpoint:    netip.MustParseAddrPort("127.0.0.1:3478"),
+		AuthorizePeer:   func(WaifusPeerIdentity) bool { return true },
+		NewClient:       newClient,
+	}}
+	if err := s.Start(); !errors.Is(err, ErrWaifusTransportIdentity) {
+		t.Fatalf("missing transport identity error = %v, want %v", err, ErrWaifusTransportIdentity)
+	}
 }
 
 func TestWaifusControlRejectsUnsafeSTUNEndpointBeforeInitialization(t *testing.T) {
@@ -225,10 +236,14 @@ func TestWaifusModeBuildsOnlyOneApplicationListener(t *testing.T) {
 }
 
 func waifusRestrictedTestConfig() *WaifusControlConfig {
+	nodePrivate := key.NewNode()
 	return &WaifusControlConfig{
 		Role:            WaifusNodeRoleRemote,
 		ApplicationPort: waifusRestrictedApplicationPort,
 		STUNEndpoint:    netip.MustParseAddrPort("127.0.0.1:3478"),
+		NodePrivateKey:  nodePrivate,
+		StableNodeID:    "restricted-test",
+		DiscoPrivateKey: key.NewDisco(),
 		AuthorizePeer: func(WaifusPeerIdentity) bool {
 			return true
 		},

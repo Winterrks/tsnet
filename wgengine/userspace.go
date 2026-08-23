@@ -72,22 +72,23 @@ type userspaceEngine struct {
 
 	linkChangeQueue execqueue.ExecQueue
 
-	logf           logger.Logf
-	wgLogger       *wglog.Logger // a wireguard-go logging wrapper
-	reqCh          chan struct{}
-	waitCh         chan struct{} // chan is closed when first Close call completes; contrast with closing bool
-	timeNow        func() mono.Time
-	tundev         *tstun.Wrapper
-	wgdev          *device.Device
-	router         router.Router
-	dialer         *tsdial.Dialer
-	confListenPort uint16 // original conf.ListenPort
-	dns            *dns.Manager
-	magicConn      *magicsock.Conn
-	netMon         *netmon.Monitor
-	health         *health.Tracker
-	netMonOwned    bool                // whether we created netMon (and thus need to close it)
-	controlKnobs   *controlknobs.Knobs // or nil
+	logf              logger.Logf
+	wgLogger          *wglog.Logger // a wireguard-go logging wrapper
+	reqCh             chan struct{}
+	waitCh            chan struct{} // chan is closed when first Close call completes; contrast with closing bool
+	timeNow           func() mono.Time
+	tundev            *tstun.Wrapper
+	wgdev             *device.Device
+	router            router.Router
+	dialer            *tsdial.Dialer
+	confListenPort    uint16 // original conf.ListenPort
+	dns               *dns.Manager
+	magicConn         *magicsock.Conn
+	netMon            *netmon.Monitor
+	health            *health.Tracker
+	netMonOwned       bool                // whether we created netMon (and thus need to close it)
+	controlKnobs      *controlknobs.Knobs // or nil
+	directOnlyNodeKey key.NodePrivate
 
 	// bird is the BIRD integration handle constructed via
 	// [HookNewBird], or nil if [Config.BIRDSocket] was empty or the
@@ -174,6 +175,11 @@ type Config struct {
 	// DirectSTUNEndpoint is the immutable IP-literal STUN destination passed
 	// to magicsock when DirectOnly is selected.
 	DirectSTUNEndpoint netip.AddrPort
+
+	// ForceNodeKey is the helper-owned WireGuard identity accepted by a
+	// DirectOnly engine. Reconfig may temporarily clear the key to stop the
+	// engine, but it cannot install a different non-zero identity.
+	ForceNodeKey key.NodePrivate
 
 	// Tun is the device used by the Engine to exchange packets with
 	// the OS.
@@ -310,8 +316,13 @@ func NewFakeUserspaceEngine(logf logger.Logf, opts ...any) (Engine, error) {
 // NewUserspaceEngine creates the named tun device and returns a
 // Tailscale Engine running on it.
 func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) {
-	if conf.DirectOnly && !directOnlyBuild {
+	switch {
+	case conf.DirectOnly && !directOnlyBuild:
 		return nil, ErrDirectOnlyBuildRequired
+	case conf.DirectOnly && conf.ForceNodeKey.IsZero():
+		return nil, ErrDirectOnlyNodeKey
+	case !conf.DirectOnly && !conf.ForceNodeKey.IsZero():
+		return nil, errors.New("forced node key requires direct-only mode")
 	}
 
 	var closePool closeOnErrorPool
@@ -374,18 +385,19 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	}
 
 	e := &userspaceEngine{
-		eventBus:       conf.EventBus,
-		timeNow:        mono.Now,
-		logf:           logf,
-		reqCh:          make(chan struct{}, 1),
-		waitCh:         make(chan struct{}),
-		tundev:         tsTUNDev,
-		router:         rtr,
-		dialer:         conf.Dialer,
-		confListenPort: conf.ListenPort,
-		controlKnobs:   conf.ControlKnobs,
-		reconfigureVPN: conf.ReconfigureVPN,
-		health:         conf.HealthTracker,
+		eventBus:          conf.EventBus,
+		timeNow:           mono.Now,
+		logf:              logf,
+		reqCh:             make(chan struct{}, 1),
+		waitCh:            make(chan struct{}),
+		tundev:            tsTUNDev,
+		router:            rtr,
+		dialer:            conf.Dialer,
+		confListenPort:    conf.ListenPort,
+		controlKnobs:      conf.ControlKnobs,
+		reconfigureVPN:    conf.ReconfigureVPN,
+		health:            conf.HealthTracker,
+		directOnlyNodeKey: conf.ForceNodeKey,
 	}
 
 	if buildfeatures.HasBird && conf.BIRDSocket != "" {
@@ -435,6 +447,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	magicsockOpts := magicsock.Options{
 		DirectOnly:         conf.DirectOnly,
 		DirectSTUNEndpoint: conf.DirectSTUNEndpoint,
+		ForceNodeKey:       conf.ForceNodeKey,
 		EventBus:           e.eventBus,
 		Logf:               logf,
 		Port:               conf.ListenPort,
@@ -819,6 +832,14 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	}
 	if dnsCfg == nil {
 		panic("dnsCfg must not be nil")
+	}
+	if !e.directOnlyNodeKey.IsZero() && !cfg.PrivateKey.IsZero() && !cfg.PrivateKey.Equal(e.directOnlyNodeKey) {
+		// Ask magicsock to apply the same validation so the public direct-only
+		// mutation counter records this rejected engine-level attempt.
+		if err := e.magicConn.SetPrivateKey(cfg.PrivateKey); err != nil {
+			return fmt.Errorf("%w: %w", ErrDirectOnlyNodeKey, err)
+		}
+		panic("direct-only magicsock accepted a replacement node key")
 	}
 
 	e.isLocalAddr.Store(ipset.NewContainsIPFunc(views.SliceOf(routerCfg.LocalAddrs)))

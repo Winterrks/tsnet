@@ -114,18 +114,20 @@ type pathLabel struct {
 // DirectOnlyCounters are fail-closed regression tripwires for prohibited
 // paths. A healthy direct-only process keeps all values at zero.
 type DirectOnlyCounters struct {
-	DERPAttempts      uint64
-	PeerRelayAttempts uint64
-	EgressAttempts    uint64
+	DERPAttempts             uint64
+	PeerRelayAttempts        uint64
+	EgressAttempts           uint64
+	IdentityMutationAttempts uint64
 }
 
 // DirectOnlyCounters returns a snapshot of prohibited-path attempts observed
 // by c. The counters do not enforce policy; direct-only choke points do.
 func (c *Conn) DirectOnlyCounters() DirectOnlyCounters {
 	return DirectOnlyCounters{
-		DERPAttempts:      c.prohibitedDERPAttempts.Load(),
-		PeerRelayAttempts: c.prohibitedPeerRelayAttempts.Load(),
-		EgressAttempts:    c.prohibitedEgressAttempts.Load(),
+		DERPAttempts:             c.prohibitedDERPAttempts.Load(),
+		PeerRelayAttempts:        c.prohibitedPeerRelayAttempts.Load(),
+		EgressAttempts:           c.prohibitedEgressAttempts.Load(),
+		IdentityMutationAttempts: c.prohibitedIdentityMutationAttempts.Load(),
 	}
 }
 
@@ -300,10 +302,12 @@ type Conn struct {
 	// waifus_direct_only tagged build.
 	directOnly         bool
 	directSTUNEndpoint netip.AddrPort
+	directOnlyNodeKey  key.NodePrivate
 
-	prohibitedDERPAttempts      atomic.Uint64
-	prohibitedPeerRelayAttempts atomic.Uint64
-	prohibitedEgressAttempts    atomic.Uint64
+	prohibitedDERPAttempts             atomic.Uint64
+	prohibitedPeerRelayAttempts        atomic.Uint64
+	prohibitedEgressAttempts           atomic.Uint64
+	prohibitedIdentityMutationAttempts atomic.Uint64
 
 	// ============================================================
 	// mu guards all following fields; see userspaceEngine lock
@@ -554,6 +558,11 @@ type Options struct {
 	// Tailscale start and kept only in memory.
 	ForceDiscoKey key.DiscoPrivate
 
+	// ForceNodeKey is the helper-owned WireGuard identity accepted in
+	// DirectOnly mode. It prevents direct callers and engine reconfiguration
+	// from replacing the process identity.
+	ForceNodeKey key.NodePrivate
+
 	// OnDERPRecv, if non-nil, is called for every non-disco packet
 	// received from DERP before the peer map lookup. If it returns
 	// true, the packet is considered handled and is not passed to
@@ -689,8 +698,14 @@ func NewConn(opts Options) (*Conn, error) {
 		return nil, ErrDirectOnlyBuildRequired
 	case opts.DirectOnly && !validDirectOnlySTUNEndpoint(opts.DirectSTUNEndpoint):
 		return nil, ErrDirectOnlySTUNEndpoint
+	case opts.DirectOnly && opts.ForceDiscoKey.IsZero():
+		return nil, ErrDirectOnlyDiscoKey
+	case opts.DirectOnly && opts.ForceNodeKey.IsZero():
+		return nil, ErrDirectOnlyNodeKey
 	case !opts.DirectOnly && opts.DirectSTUNEndpoint.IsValid():
 		return nil, errors.New("direct STUN endpoint requires direct-only mode")
+	case !opts.DirectOnly && !opts.ForceNodeKey.IsZero():
+		return nil, errors.New("forced node key requires direct-only mode")
 	case opts.NetMon == nil:
 		return nil, errors.New("magicsock.Options.NetMon must be non-nil")
 	case opts.EventBus == nil:
@@ -700,6 +715,7 @@ func NewConn(opts Options) (*Conn, error) {
 	c := newConn(opts.logf())
 	c.directOnly = opts.DirectOnly
 	c.directSTUNEndpoint = opts.DirectSTUNEndpoint
+	c.directOnlyNodeKey = opts.ForceNodeKey
 	if c.directOnly {
 		c.relayManager.disable(&c.prohibitedPeerRelayAttempts)
 	}
@@ -1319,6 +1335,11 @@ func (c *Conn) DiscoPublicKey() key.DiscoPublic {
 // should provide a mechanism for seamless rotation by supporting short term use
 // of the old key.
 func (c *Conn) RotateDiscoKey() {
+	if c.directOnly {
+		c.prohibitedIdentityMutationAttempts.Add(1)
+		c.logf("rejecting discovery-key rotation in direct-only mode")
+		return
+	}
 	oldShort := c.discoAtomic.Short()
 	newPrivate := key.NewDisco()
 
@@ -1609,6 +1630,14 @@ var (
 	// ErrDirectOnlySTUNEndpoint reports a missing or unsafe immutable STUN
 	// destination in direct-only mode.
 	ErrDirectOnlySTUNEndpoint = errors.New("valid direct-only STUN endpoint is required")
+
+	// ErrDirectOnlyDiscoKey reports a missing helper-owned immutable discovery
+	// key in direct-only mode.
+	ErrDirectOnlyDiscoKey = errors.New("direct-only discovery key is required")
+
+	// ErrDirectOnlyNodeKey reports a missing or replacement helper-owned
+	// WireGuard identity in direct-only mode.
+	ErrDirectOnlyNodeKey = errors.New("direct-only node key is required and immutable")
 
 	// ErrDirectOnlyEgress reports an attempted direct-only network-check probe
 	// outside the immutable STUN destination.
@@ -2901,6 +2930,10 @@ func (c *Conn) SetPreferredPort(port uint16) {
 func (c *Conn) SetPrivateKey(privateKey key.NodePrivate) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.directOnly && !privateKey.IsZero() && !privateKey.Equal(c.directOnlyNodeKey) {
+		c.prohibitedIdentityMutationAttempts.Add(1)
+		return ErrDirectOnlyNodeKey
+	}
 
 	oldKey, newKey := c.privateKey, privateKey
 	if newKey.Equal(oldKey) {
@@ -4046,6 +4079,20 @@ func (c *Conn) Rebind() {
 
 	if len(ifIPs) > 0 {
 		c.maybeCloseDERPsOnRebind(ifIPs)
+	}
+	c.resetEndpointStates()
+}
+
+// RebindToNewPort closes and re-binds the UDP sockets without attempting to
+// reuse their current port. An explicitly configured preferred port is still
+// honored; otherwise the OS selects a fresh random port. It is useful for
+// exercising and recovering from network changes that invalidate the old
+// socket tuple. It should be followed by a call to [Conn.ReSTUN].
+func (c *Conn) RebindToNewPort() {
+	metricRebindCalls.Add(1)
+	if err := c.rebind(dropCurrentPort); err != nil {
+		c.logf("%v", err)
+		return
 	}
 	c.resetEndpointStates()
 }

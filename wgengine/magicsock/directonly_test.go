@@ -36,6 +36,71 @@ func TestDirectOnlyRequiresConfiguredSTUNEndpoint(t *testing.T) {
 	}
 }
 
+func TestDirectOnlyRequiresConfiguredDiscoveryKey(t *testing.T) {
+	opts := directOnlyTestOptions(t)
+	opts.ForceDiscoKey = key.DiscoPrivate{}
+	if _, err := NewConn(opts); !errors.Is(err, ErrDirectOnlyDiscoKey) {
+		t.Fatalf("NewConn error = %v, want %v", err, ErrDirectOnlyDiscoKey)
+	}
+}
+
+func TestDirectOnlyRequiresConfiguredNodeKey(t *testing.T) {
+	opts := directOnlyTestOptions(t)
+	opts.ForceNodeKey = key.NodePrivate{}
+	if _, err := NewConn(opts); !errors.Is(err, ErrDirectOnlyNodeKey) {
+		t.Fatalf("NewConn error = %v, want %v", err, ErrDirectOnlyNodeKey)
+	}
+}
+
+func TestDirectOnlyPinsForcedNodeKey(t *testing.T) {
+	opts := directOnlyTestOptions(t)
+	forced := opts.ForceNodeKey
+	c, err := NewConn(opts)
+	if err != nil {
+		t.Fatalf("NewConn: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	if err := c.SetPrivateKey(forced); err != nil {
+		t.Fatalf("install configured node key: %v", err)
+	}
+	if err := c.SetPrivateKey(key.NewNode()); !errors.Is(err, ErrDirectOnlyNodeKey) {
+		t.Fatalf("replacement node key error = %v, want %v", err, ErrDirectOnlyNodeKey)
+	}
+	if got := c.publicKeyAtomic.Load(); got != forced.Public() {
+		t.Fatalf("node key after replacement attempt = %v, want %v", got, forced.Public())
+	}
+	if err := c.SetPrivateKey(key.NodePrivate{}); err != nil {
+		t.Fatalf("temporarily clear node key: %v", err)
+	}
+	if err := c.SetPrivateKey(forced); err != nil {
+		t.Fatalf("restore configured node key: %v", err)
+	}
+	if got := c.DirectOnlyCounters().IdentityMutationAttempts; got != 1 {
+		t.Fatalf("identity mutation attempts = %d, want 1", got)
+	}
+}
+
+func TestDirectOnlyPinsForcedDiscoveryKey(t *testing.T) {
+	forced := key.NewDisco()
+	opts := directOnlyTestOptions(t)
+	opts.ForceDiscoKey = forced
+	c, err := NewConn(opts)
+	if err != nil {
+		t.Fatalf("NewConn: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	if got := c.DiscoPublicKey(); got != forced.Public() {
+		t.Fatalf("initial discovery key = %v, want configured key %v", got, forced.Public())
+	}
+	c.RotateDiscoKey()
+	if got := c.DiscoPublicKey(); got != forced.Public() {
+		t.Fatalf("discovery key after rotation attempt = %v, want pinned key %v", got, forced.Public())
+	}
+	if got := c.DirectOnlyCounters().IdentityMutationAttempts; got != 1 {
+		t.Fatalf("identity mutation attempts = %d, want 1", got)
+	}
+}
+
 func TestDirectOnlySTUNUsesOnlyConfiguredDestinationWithoutDERP(t *testing.T) {
 	stunAddr, cleanup := stuntest.Serve(t)
 	t.Cleanup(cleanup)
@@ -77,6 +142,32 @@ func TestDirectOnlySTUNUsesOnlyConfiguredDestinationWithoutDERP(t *testing.T) {
 	}
 	if got := c.DirectOnlyCounters().EgressAttempts; got != 1 {
 		t.Fatalf("prohibited egress attempts = %d, want 1", got)
+	}
+}
+
+func TestDirectOnlyRebindToNewPortPreservesRandomPortPolicy(t *testing.T) {
+	c := newDirectOnlyTestConn(t)
+	if _, _, err := c.bind.Open(0); err != nil {
+		t.Fatalf("bind.Open: %v", err)
+	}
+	oldPort := c.LocalPort()
+	if oldPort == 0 {
+		t.Fatal("initial direct-only UDP port is zero")
+	}
+	for range 5 {
+		c.RebindToNewPort()
+		if c.LocalPort() != oldPort {
+			break
+		}
+	}
+	if got := c.LocalPort(); got == 0 || got == oldPort {
+		t.Fatalf("rebound UDP port = %d, want fresh non-zero port distinct from %d", got, oldPort)
+	}
+	if preferred := c.port.Load(); preferred != 0 {
+		t.Fatalf("random-port rebind changed preferred port to %d", preferred)
+	}
+	if counters := c.DirectOnlyCounters(); counters != (DirectOnlyCounters{}) {
+		t.Fatalf("direct rebind changed prohibited counters: %+v", counters)
 	}
 }
 
@@ -303,6 +394,8 @@ func directOnlyTestOptions(t *testing.T) Options {
 	return Options{
 		DirectOnly:             true,
 		DirectSTUNEndpoint:     netip.MustParseAddrPort("127.0.0.1:3478"),
+		ForceNodeKey:           key.NewNode(),
+		ForceDiscoKey:          key.NewDisco(),
 		DisablePortMapper:      true,
 		Logf:                   logger.Discard,
 		NetMon:                 netMon,

@@ -228,6 +228,10 @@ var (
 	// destination.
 	ErrWaifusSTUNEndpoint = errors.New("valid Waifus STUN endpoint is required")
 
+	// ErrWaifusTransportIdentity reports missing immutable node/discovery keys
+	// owned by the embedding helper.
+	ErrWaifusTransportIdentity = errors.New("Waifus transport identity is required")
+
 	// ErrWaifusRuntimeConfiguration reports generic tsnet configuration that
 	// would enable credentials, routes, or services outside the Waifus helper.
 	ErrWaifusRuntimeConfiguration = errors.New("generic tsnet configuration is forbidden in Waifus mode")
@@ -243,6 +247,11 @@ var (
 	// ErrWaifusPeerUnavailable reports a dial target that is absent, revoked,
 	// malformed, or outside the current pair-isolated view.
 	ErrWaifusPeerUnavailable = errors.New("Waifus peer is unavailable")
+
+	// ErrWaifusDirectUnavailable reports an approved peer for which no direct
+	// UDP/WireGuard path could be established before the dial deadline. Waifus
+	// mode never turns this condition into a relay attempt.
+	ErrWaifusDirectUnavailable = errors.New("Waifus direct path is unavailable")
 )
 
 // WaifusControlProfile selects one of the control-plane profiles compiled
@@ -285,6 +294,9 @@ type WaifusControlConfig struct {
 	Role            WaifusNodeRole
 	ApplicationPort uint16
 	STUNEndpoint    netip.AddrPort
+	NodePrivateKey  key.NodePrivate
+	StableNodeID    tailcfg.StableNodeID
+	DiscoPrivateKey key.DiscoPrivate
 	AuthorizePeer   WaifusPeerAuthorizer
 	NewClient       WaifusControlClientFactory
 }
@@ -294,6 +306,9 @@ type waifusControlSnapshot struct {
 	role            WaifusNodeRole
 	applicationPort uint16
 	stunEndpoint    netip.AddrPort
+	nodePrivateKey  key.NodePrivate
+	stableNodeID    tailcfg.StableNodeID
+	discoPrivateKey key.DiscoPrivate
 	authorizePeer   WaifusPeerAuthorizer
 	newClient       WaifusControlClientFactory
 }
@@ -449,6 +464,8 @@ type Server struct {
 	fallbackTCPHandlers set.HandleSet[FallbackTCPHandler]
 	dialer              *tsdial.Dialer
 	advertisedServices  map[tailcfg.ServiceName]int
+	waifusConnections   map[key.NodePublic]map[*waifusTrackedConn]struct{}
+	waifusClosing       bool
 	closeOnce           sync.Once
 	waifusControl       *waifusControlSnapshot
 }
@@ -494,15 +511,126 @@ func (s *Server) DialWaifusPeer(ctx context.Context, peerKey key.NodePublic) (ne
 	if err := s.Start(); err != nil {
 		return nil, err
 	}
-	if err := s.awaitRunning(ctx); err != nil {
-		return nil, err
-	}
-	address, ok := s.lb.WaifusPeerAddress(peerKey)
-	if !ok {
-		return nil, ErrWaifusPeerUnavailable
+	var address netip.Addr
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if s.lb.WaifusNetworkMapError() != nil {
+			return nil, ErrWaifusPeerUnavailable
+		}
+		if resolved, ok := s.lb.WaifusPeerAddress(peerKey); ok {
+			address = resolved
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
 	}
 	target := net.JoinHostPort(address.String(), strconv.Itoa(int(s.waifusControl.applicationPort)))
-	return s.dialer.UserDial(ctx, "tcp", target)
+	connection, err := s.dialer.UserDial(ctx, "tcp", target)
+	if err != nil && errors.Is(err, context.DeadlineExceeded) {
+		return nil, fmt.Errorf("%w: %v", ErrWaifusDirectUnavailable, err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.trackWaifusConnection(peerKey, connection), nil
+}
+
+// RefreshWaifusPeerAuthorizations immediately applies local pair revocations
+// to the installed peer set without contacting coordination.
+func (s *Server) RefreshWaifusPeerAuthorizations() (int, error) {
+	if !s.isWaifusMode() {
+		return 0, fmt.Errorf("%w: RefreshWaifusPeerAuthorizations requires Waifus mode", ErrWaifusOperationUnavailable)
+	}
+	if err := s.Start(); err != nil {
+		return 0, err
+	}
+	// Close streams while the peer's WireGuard path is still installed so
+	// netstack can deliver the TCP close. Removing the peer first would strand
+	// the remote socket until its own timeout because the final packet would no
+	// longer have a route.
+	drains := s.closeUnauthorizedWaifusConnections()
+	s.waitForWaifusConnectionDrains(drains)
+	removed, err := s.lb.RefreshWaifusPeerAuthorizations()
+	if err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
+type waifusConnectionDrain struct {
+	peerKey key.NodePublic
+	txBytes uint64
+	rxBytes uint64
+}
+
+func (s *Server) closeUnauthorizedWaifusConnections() []waifusConnectionDrain {
+	s.mu.Lock()
+	keys := make([]key.NodePublic, 0, len(s.waifusConnections))
+	for peerKey := range s.waifusConnections {
+		keys = append(keys, peerKey)
+	}
+	s.mu.Unlock()
+	var drains []waifusConnectionDrain
+	engine := s.sys.Engine.Get()
+	for _, peerKey := range keys {
+		if _, ok := s.lb.WaifusPeerAddress(peerKey); ok {
+			continue
+		}
+		s.mu.Lock()
+		connections := make([]*waifusTrackedConn, 0, len(s.waifusConnections[peerKey]))
+		for connection := range s.waifusConnections[peerKey] {
+			connections = append(connections, connection)
+		}
+		s.mu.Unlock()
+		if len(connections) != 0 {
+			if peer, ok := engine.PeerByKey(peerKey); ok {
+				drains = append(drains, waifusConnectionDrain{
+					peerKey: peerKey,
+					txBytes: peer.TxBytes(),
+					rxBytes: peer.RxBytes(),
+				})
+			}
+		}
+		for _, connection := range connections {
+			_ = connection.Close()
+		}
+	}
+	return drains
+}
+
+func (s *Server) waitForWaifusConnectionDrains(drains []waifusConnectionDrain) {
+	if len(drains) == 0 {
+		return
+	}
+	engine := s.sys.Engine.Get()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for len(drains) != 0 {
+		remaining := drains[:0]
+		for _, drain := range drains {
+			peer, ok := engine.PeerByKey(drain.peerKey)
+			// Keep the WireGuard route installed until the close was sent and
+			// subsequent peer traffic arrived (or until the bounded deadline).
+			if ok && (peer.TxBytes() <= drain.txBytes || peer.RxBytes() <= drain.rxBytes) {
+				remaining = append(remaining, drain)
+			}
+		}
+		drains = remaining
+		if len(drains) == 0 {
+			return
+		}
+		select {
+		case <-deadline.C:
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // awaitRunning waits until the backend is in state Running.
@@ -770,10 +898,20 @@ func (s *Server) close() {
 	// acquire s.mu, and waiting for those goroutines while holding the lock
 	// would deadlock.
 	s.mu.Lock()
+	s.waifusClosing = true
 	for _, ln := range s.listeners {
 		ln.closeLocked()
 	}
+	var waifusConnections []*waifusTrackedConn
+	for _, connections := range s.waifusConnections {
+		for connection := range connections {
+			waifusConnections = append(waifusConnections, connection)
+		}
+	}
 	s.mu.Unlock()
+	for _, connection := range waifusConnections {
+		_ = connection.Close()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -862,6 +1000,9 @@ func (s *Server) snapshotWaifusControl() (*waifusControlSnapshot, error) {
 	if !validWaifusSTUNEndpoint(config.STUNEndpoint) {
 		return nil, ErrWaifusSTUNEndpoint
 	}
+	if config.NodePrivateKey.IsZero() || config.StableNodeID == "" || config.DiscoPrivateKey.IsZero() {
+		return nil, ErrWaifusTransportIdentity
+	}
 	if reason := s.forbiddenWaifusRuntimeConfiguration(); reason != "" {
 		return nil, fmt.Errorf("%w: %s", ErrWaifusRuntimeConfiguration, reason)
 	}
@@ -870,6 +1011,9 @@ func (s *Server) snapshotWaifusControl() (*waifusControlSnapshot, error) {
 		role:            config.Role,
 		applicationPort: config.ApplicationPort,
 		stunEndpoint:    config.STUNEndpoint,
+		nodePrivateKey:  config.NodePrivateKey,
+		stableNodeID:    config.StableNodeID,
+		discoPrivateKey: config.DiscoPrivateKey,
 		authorizePeer:   config.AuthorizePeer,
 		newClient:       config.NewClient,
 	}, nil
@@ -1112,12 +1256,18 @@ func (s *Server) start() (reterr error) {
 	s.dialer = &tsdial.Dialer{Logf: tsLogf} // mutated below (before used)
 	s.dialer.SetBus(sys.Bus.Get())
 	var directSTUNEndpoint netip.AddrPort
+	var forceNodeKey key.NodePrivate
+	var forceDiscoKey key.DiscoPrivate
 	if s.waifusControl != nil {
 		directSTUNEndpoint = s.waifusControl.stunEndpoint
+		forceNodeKey = s.waifusControl.nodePrivateKey
+		forceDiscoKey = s.waifusControl.discoPrivateKey
 	}
 	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
 		DirectOnly:         s.waifusControl != nil,
 		DirectSTUNEndpoint: directSTUNEndpoint,
+		ForceNodeKey:       forceNodeKey,
+		ForceDiscoKey:      forceDiscoKey,
 		Tun:                s.Tun,
 		EventBus:           sys.Bus.Get(),
 		ListenPort:         s.Port,
@@ -1208,7 +1358,13 @@ func (s *Server) start() (reterr error) {
 		localBackendOptions = append(localBackendOptions, ipnlocal.WithWaifusNetworkMapPolicy(
 			waifusControl.role,
 			waifusControl.applicationPort,
+			waifusControl.nodePrivateKey.Public(),
+			waifusControl.discoPrivateKey.Public(),
 			waifusControl.authorizePeer,
+		))
+		localBackendOptions = append(localBackendOptions, ipnlocal.WithWaifusLocalIdentity(
+			waifusControl.nodePrivateKey,
+			waifusControl.stableNodeID,
 		))
 	}
 	lb, err := ipnlocal.NewLocalBackend(
@@ -1552,6 +1708,15 @@ func (s *Server) getTCPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 			}
 		}
 		return nil, true // don't handle, don't forward to localhost
+	}
+	if s.waifusControl != nil {
+		peerKey, ok := s.lb.WaifusPeerKeyForAddress(src.Addr())
+		if !ok {
+			return nil, true
+		}
+		return func(connection net.Conn) {
+			ln.handle(s.trackWaifusConnection(peerKey, connection))
+		}, true
 	}
 	return ln.handle, true
 }
@@ -2600,6 +2765,55 @@ type listener struct {
 	// gonetLn is set by [listen] when a TUN is in use and terminates the listener.
 	// gonetLn is nil when TUN is nil.
 	gonetLn net.Listener
+}
+
+type waifusTrackedConn struct {
+	net.Conn
+	server    *Server
+	peerKey   key.NodePublic
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (s *Server) trackWaifusConnection(peerKey key.NodePublic, connection net.Conn) net.Conn {
+	tracked := &waifusTrackedConn{
+		Conn:    connection,
+		server:  s,
+		peerKey: peerKey,
+	}
+	s.mu.Lock()
+	closing := s.waifusClosing
+	if !closing {
+		if s.waifusConnections == nil {
+			s.waifusConnections = make(map[key.NodePublic]map[*waifusTrackedConn]struct{})
+		}
+		if s.waifusConnections[peerKey] == nil {
+			s.waifusConnections[peerKey] = make(map[*waifusTrackedConn]struct{})
+		}
+		s.waifusConnections[peerKey][tracked] = struct{}{}
+	}
+	s.mu.Unlock()
+	// Close if authorization changed between flow admission and registration.
+	if closing {
+		_ = tracked.Close()
+	} else if _, ok := s.lb.WaifusPeerAddress(peerKey); !ok {
+		_ = tracked.Close()
+	}
+	return tracked
+}
+
+func (c *waifusTrackedConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.server.mu.Lock()
+		connections := c.server.waifusConnections[c.peerKey]
+		delete(connections, c)
+		if len(connections) == 0 {
+			delete(c.server.waifusConnections, c.peerKey)
+		}
+		c.server.mu.Unlock()
+		c.closeErr = c.Conn.Close()
+	})
+	return c.closeErr
 }
 
 func (ln *listener) Accept() (net.Conn, error) {

@@ -14,6 +14,7 @@ import (
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/persist"
 	"tailscale.com/types/views"
 	"tailscale.com/wgengine/filter"
 )
@@ -25,6 +26,10 @@ var (
 
 	// ErrWaifusNetworkMapPolicy reports an invalid immutable validator policy.
 	ErrWaifusNetworkMapPolicy = errors.New("invalid Waifus network map policy")
+
+	// ErrWaifusRepairRequired reports missing, corrupt, or rotated local
+	// transport identity. V1 never silently replaces this identity.
+	ErrWaifusRepairRequired = errors.New("Waifus transport identity requires repair")
 )
 
 // WaifusNodeRole identifies which side of the host-centered pair graph owns a
@@ -55,15 +60,126 @@ type WaifusPeerAuthorizer func(identity WaifusPeerIdentity) bool
 type waifusNetworkMapValidator struct {
 	role            WaifusNodeRole
 	applicationPort uint16
+	selfNodeKey     key.NodePublic
+	selfDiscoKey    key.DiscoPublic
 	authorizePeer   WaifusPeerAuthorizer
 	identities      map[key.NodePublic]WaifusPeerIdentity
 	nodeIDOwners    map[tailcfg.NodeID]key.NodePublic
 	stableIDOwners  map[tailcfg.StableNodeID]key.NodePublic
 	discoKeyOwners  map[key.DiscoPublic]key.NodePublic
 	addressOwners   map[netip.Prefix]key.NodePublic
+	privateNodeKey  key.NodePrivate
 }
 
-func newWaifusNetworkMapValidator(role WaifusNodeRole, applicationPort uint16, authorizePeer WaifusPeerAuthorizer) (*waifusNetworkMapValidator, error) {
+// ValidateControlStatus validates the complete successful status envelope
+// before LocalBackend can persist credentials or mutate engine state. Waifus
+// coordination sends full maps only: interactive login and map-less success
+// transitions are not part of the injected-client contract.
+func (v *waifusNetworkMapValidator) ValidateControlStatus(
+	nm *netmap.NetworkMap,
+	incoming persist.PersistView,
+	current persist.PersistView,
+	url string,
+	loggedIn bool,
+) error {
+	if nm == nil {
+		return v.invalid("successful status is missing its full map")
+	}
+	if url != "" {
+		return v.invalid("interactive control URL is forbidden")
+	}
+	if !loggedIn {
+		return v.invalid("map status is not logged in")
+	}
+	privateKey, err := validateWaifusPersist(nm, incoming)
+	if err != nil {
+		return err
+	}
+	if current.Valid() {
+		stored := current.AsStruct()
+		if !stored.PrivateNodeKey.IsZero() {
+			if _, err := validateWaifusPersist(nm, current); err != nil {
+				return fmt.Errorf("%w: corrupt stored identity: %v", ErrWaifusRepairRequired, err)
+			}
+			if !stored.PrivateNodeKey.Equal(privateKey) {
+				return fmt.Errorf("%w: control status attempted to replace the stored node key", ErrWaifusRepairRequired)
+			}
+		}
+	}
+	if !v.privateNodeKey.IsZero() && !v.privateNodeKey.Equal(privateKey) {
+		return fmt.Errorf("%w: control status attempted node-key rotation", ErrWaifusRepairRequired)
+	}
+	if err := v.Validate(nm); err != nil {
+		return err
+	}
+	v.privateNodeKey = privateKey
+	return nil
+}
+
+func validateWaifusPersist(nm *netmap.NetworkMap, view persist.PersistView) (key.NodePrivate, error) {
+	if !view.Valid() {
+		return key.NodePrivate{}, fmt.Errorf("%w: missing local node key", ErrWaifusRepairRequired)
+	}
+	p := view.AsStruct()
+	if p.PrivateNodeKey.IsZero() {
+		return key.NodePrivate{}, fmt.Errorf("%w: missing local node key", ErrWaifusRepairRequired)
+	}
+	if nm == nil || !nm.SelfNode.Valid() || p.PrivateNodeKey.Public() != nm.NodeKey || nm.SelfNode.Key() != nm.NodeKey {
+		return key.NodePrivate{}, fmt.Errorf("%w: local node key does not match the map identity", ErrWaifusRepairRequired)
+	}
+	if !p.OldPrivateNodeKey.IsZero() {
+		return key.NodePrivate{}, fmt.Errorf("%w: node-key rotation state is forbidden", ErrWaifusRepairRequired)
+	}
+	if p.NodeID == "" || p.NodeID != nm.SelfNode.StableID() {
+		return key.NodePrivate{}, fmt.Errorf("%w: stable node identity does not match the map", ErrWaifusRepairRequired)
+	}
+	if !p.UserProfile.Equal(new(tailcfg.UserProfile)) {
+		return key.NodePrivate{}, fmt.Errorf("%w: generic user profile state is forbidden", ErrWaifusRepairRequired)
+	}
+	if !p.NetworkLockKey.IsZero() || len(p.DisallowedTKAStateIDs) != 0 {
+		return key.NodePrivate{}, fmt.Errorf("%w: tailnet-lock identity state is forbidden", ErrWaifusRepairRequired)
+	}
+	if p.AttestationKey != nil && !p.AttestationKey.IsZero() {
+		return key.NodePrivate{}, fmt.Errorf("%w: hardware attestation state is forbidden", ErrWaifusRepairRequired)
+	}
+	return p.PrivateNodeKey, nil
+}
+
+func validateWaifusLocalIdentity(current, expected *persist.Persist) error {
+	if current == nil || expected == nil || current.PrivateNodeKey.IsZero() || expected.PrivateNodeKey.IsZero() {
+		return fmt.Errorf("%w: missing stored local node key", ErrWaifusRepairRequired)
+	}
+	if !current.PrivateNodeKey.Equal(expected.PrivateNodeKey) || current.NodeID != expected.NodeID {
+		return fmt.Errorf("%w: stored identity does not match the helper-owned identity", ErrWaifusRepairRequired)
+	}
+	if !current.OldPrivateNodeKey.IsZero() || !current.UserProfile.Equal(new(tailcfg.UserProfile)) ||
+		!current.NetworkLockKey.IsZero() || len(current.DisallowedTKAStateIDs) != 0 ||
+		(current.AttestationKey != nil && !current.AttestationKey.IsZero()) {
+		return fmt.Errorf("%w: stored identity contains forbidden rotation or generic tailnet state", ErrWaifusRepairRequired)
+	}
+	return nil
+}
+
+func validateWaifusStoredIdentity(current, expected *persist.Persist) (initialize bool, err error) {
+	if current == nil || current.Equals(new(persist.Persist)) {
+		return true, nil
+	}
+	if current.PrivateNodeKey.IsZero() {
+		return false, fmt.Errorf("%w: stored identity is corrupt but has no node key", ErrWaifusRepairRequired)
+	}
+	if err := validateWaifusLocalIdentity(current, expected); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func newWaifusNetworkMapValidator(
+	role WaifusNodeRole,
+	applicationPort uint16,
+	selfNodeKey key.NodePublic,
+	selfDiscoKey key.DiscoPublic,
+	authorizePeer WaifusPeerAuthorizer,
+) (*waifusNetworkMapValidator, error) {
 	if role != WaifusNodeRoleHost && role != WaifusNodeRoleRemote {
 		return nil, fmt.Errorf("%w: unknown role %d", ErrWaifusNetworkMapPolicy, role)
 	}
@@ -73,9 +189,14 @@ func newWaifusNetworkMapValidator(role WaifusNodeRole, applicationPort uint16, a
 	if applicationPort == 0 {
 		return nil, fmt.Errorf("%w: application port is required", ErrWaifusNetworkMapPolicy)
 	}
+	if selfNodeKey.IsZero() || selfDiscoKey.IsZero() {
+		return nil, fmt.Errorf("%w: local node and discovery keys are required", ErrWaifusNetworkMapPolicy)
+	}
 	return &waifusNetworkMapValidator{
 		role:            role,
 		applicationPort: applicationPort,
+		selfNodeKey:     selfNodeKey,
+		selfDiscoKey:    selfDiscoKey,
 		authorizePeer:   authorizePeer,
 		identities:      make(map[key.NodePublic]WaifusPeerIdentity),
 		nodeIDOwners:    make(map[tailcfg.NodeID]key.NodePublic),
@@ -109,6 +230,9 @@ func (v *waifusNetworkMapValidator) Validate(nm *netmap.NetworkMap) error {
 	}
 	if nm.NodeKey.IsZero() || nm.NodeKey != self.NodeKey {
 		return v.invalid("map node key does not match self node")
+	}
+	if self.NodeKey != v.selfNodeKey || self.DiscoKey != v.selfDiscoKey {
+		return v.invalid("map attempted to replace the configured local transport identity")
 	}
 
 	identities := make([]WaifusPeerIdentity, 0, len(nm.Peers)+1)
@@ -245,7 +369,7 @@ func validateWaifusNode(view tailcfg.NodeView) (WaifusPeerIdentity, error) {
 
 func validateWaifusHostinfo(view tailcfg.HostinfoView) error {
 	if !view.Valid() {
-		return nil
+		return errors.New("empty host metadata object is required")
 	}
 	hostinfo := view.AsStruct()
 	if !hostinfo.Equal(new(tailcfg.Hostinfo)) {

@@ -188,6 +188,7 @@ func TestWaifusControlFactoryIsPinnedForServerLifetime(t *testing.T) {
 func TestWaifusControlFactoryErrorHasNoStockFallback(t *testing.T) {
 	wantErr := errors.New("custom factory sentinel")
 	var calls int
+	nodePrivate := key.NewNode()
 	s := &Server{
 		Dir:       t.TempDir(),
 		Store:     new(mem.Store),
@@ -196,6 +197,9 @@ func TestWaifusControlFactoryErrorHasNoStockFallback(t *testing.T) {
 			Role:            WaifusNodeRoleRemote,
 			ApplicationPort: waifusRestrictedApplicationPort,
 			STUNEndpoint:    netip.MustParseAddrPort("127.0.0.1:3478"),
+			NodePrivateKey:  nodePrivate,
+			StableNodeID:    "factory-error",
+			DiscoPrivateKey: key.NewDisco(),
 			AuthorizePeer:   func(WaifusPeerIdentity) bool { return true },
 			NewClient: func(WaifusControlProfile, controlclient.Options) (controlclient.Client, error) {
 				calls++

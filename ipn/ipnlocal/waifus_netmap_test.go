@@ -21,6 +21,8 @@ import (
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/opt"
+	"tailscale.com/types/persist"
+	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
@@ -42,7 +44,13 @@ func TestWaifusNetworkMapValidatorAcceptsPairIsolatedViews(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			nm := validWaifusNetworkMap(tt.peerCount)
-			validator, err := newWaifusNetworkMapValidator(tt.role, waifusTestApplicationPort, func(WaifusPeerIdentity) bool { return true })
+			validator, err := newWaifusNetworkMapValidator(
+				tt.role,
+				waifusTestApplicationPort,
+				nm.NodeKey,
+				nm.SelfNode.DiscoKey(),
+				func(WaifusPeerIdentity) bool { return true },
+			)
 			if err != nil {
 				t.Fatalf("newWaifusNetworkMapValidator: %v", err)
 			}
@@ -108,6 +116,15 @@ func TestWaifusNetworkMapValidatorRejectsGenericTailnetState(t *testing.T) {
 				n.Name = "forbidden.example."
 				n.User = 1
 				n.Machine = key.NewMachine().Public()
+				nm.Peers[0] = n.View()
+			},
+		},
+		{
+			name: "missing host metadata object",
+			role: WaifusNodeRoleRemote,
+			mutate: func(nm *netmap.NetworkMap) {
+				n := nm.Peers[0].AsStruct()
+				n.Hostinfo = tailcfg.HostinfoView{}
 				nm.Peers[0] = n.View()
 			},
 		},
@@ -261,7 +278,7 @@ func TestWaifusNetworkMapValidatorRejectsGenericTailnetState(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			nm := validWaifusNetworkMap(1)
 			approvedKey := nm.Peers[0].Key()
-			validator, err := newWaifusNetworkMapValidator(tt.role, waifusTestApplicationPort, func(identity WaifusPeerIdentity) bool {
+			validator, err := newWaifusNetworkMapValidator(tt.role, waifusTestApplicationPort, nm.NodeKey, nm.SelfNode.DiscoKey(), func(identity WaifusPeerIdentity) bool {
 				return identity.NodeKey == approvedKey
 			})
 			if err != nil {
@@ -277,7 +294,13 @@ func TestWaifusNetworkMapValidatorRejectsGenericTailnetState(t *testing.T) {
 
 func TestWaifusNetworkMapValidatorPinsIdentityAndAddress(t *testing.T) {
 	nm := validWaifusNetworkMap(1)
-	validator, err := newWaifusNetworkMapValidator(WaifusNodeRoleRemote, waifusTestApplicationPort, func(WaifusPeerIdentity) bool { return true })
+	validator, err := newWaifusNetworkMapValidator(
+		WaifusNodeRoleRemote,
+		waifusTestApplicationPort,
+		nm.NodeKey,
+		nm.SelfNode.DiscoKey(),
+		func(WaifusPeerIdentity) bool { return true },
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,6 +346,179 @@ func TestWaifusNetworkMapValidatorPinsIdentityAndAddress(t *testing.T) {
 	}
 }
 
+func TestWaifusControlStatusRequiresAndPinsLocalIdentity(t *testing.T) {
+	newValidator := func(t *testing.T, nm *netmap.NetworkMap) *waifusNetworkMapValidator {
+		t.Helper()
+		validator, err := newWaifusNetworkMapValidator(
+			WaifusNodeRoleRemote,
+			waifusTestApplicationPort,
+			nm.NodeKey,
+			nm.SelfNode.DiscoKey(),
+			func(WaifusPeerIdentity) bool { return true },
+		)
+		if err != nil {
+			t.Fatalf("newWaifusNetworkMapValidator: %v", err)
+		}
+		return validator
+	}
+	newStatus := func() (*netmap.NetworkMap, *persist.Persist) {
+		nm := validWaifusNetworkMap(1)
+		privateKey := key.NewNode()
+		self := nm.SelfNode.AsStruct()
+		self.Key = privateKey.Public()
+		nm.SelfNode = self.View()
+		nm.NodeKey = self.Key
+		return nm, &persist.Persist{
+			PrivateNodeKey: privateKey,
+			NodeID:         self.StableID,
+		}
+	}
+
+	t.Run("valid status and endpoint mobility", func(t *testing.T) {
+		nm, identity := newStatus()
+		validator := newValidator(t, nm)
+		if err := validator.ValidateControlStatus(nm, identity.View(), persist.PersistView{}, "", true); err != nil {
+			t.Fatalf("first ValidateControlStatus: %v", err)
+		}
+		moved := cloneWaifusTestNetworkMap(nm)
+		self := moved.SelfNode.AsStruct()
+		self.Endpoints = []netip.AddrPort{netip.MustParseAddrPort("192.0.2.44:41641")}
+		moved.SelfNode = self.View()
+		if err := validator.ValidateControlStatus(moved, identity.View(), identity.View(), "", true); err != nil {
+			t.Fatalf("moved ValidateControlStatus: %v", err)
+		}
+	})
+
+	t.Run("status envelope", func(t *testing.T) {
+		nm, identity := newStatus()
+		tests := []struct {
+			name     string
+			nm       *netmap.NetworkMap
+			url      string
+			loggedIn bool
+		}{
+			{name: "missing full map", loggedIn: true},
+			{name: "interactive URL", nm: nm, url: "https://forbidden.invalid", loggedIn: true},
+			{name: "not logged in", nm: nm},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				validatorMap := tt.nm
+				if validatorMap == nil {
+					validatorMap = nm
+				}
+				err := newValidator(t, validatorMap).ValidateControlStatus(tt.nm, identity.View(), persist.PersistView{}, tt.url, tt.loggedIn)
+				if !errors.Is(err, ErrWaifusNetworkMap) {
+					t.Fatalf("ValidateControlStatus error = %v, want %v", err, ErrWaifusNetworkMap)
+				}
+			})
+		}
+	})
+
+	t.Run("missing or corrupt identity", func(t *testing.T) {
+		nm, identity := newStatus()
+		tests := []struct {
+			name     string
+			incoming persist.PersistView
+			current  persist.PersistView
+		}{
+			{name: "missing"},
+			{name: "empty", incoming: (&persist.Persist{}).View()},
+			{name: "wrong private key", incoming: (&persist.Persist{PrivateNodeKey: key.NewNode(), NodeID: identity.NodeID}).View()},
+			{name: "old private key", incoming: func() persist.PersistView {
+				changed := identity.Clone()
+				changed.OldPrivateNodeKey = key.NewNode()
+				return changed.View()
+			}()},
+			{name: "wrong stable ID", incoming: func() persist.PersistView {
+				changed := identity.Clone()
+				changed.NodeID = "wrong-node"
+				return changed.View()
+			}()},
+			{name: "generic user profile", incoming: func() persist.PersistView {
+				changed := identity.Clone()
+				changed.UserProfile = tailcfg.UserProfile{ID: 1, LoginName: "forbidden"}
+				return changed.View()
+			}()},
+			{name: "tailnet lock key", incoming: func() persist.PersistView {
+				changed := identity.Clone()
+				changed.NetworkLockKey = key.NewNLPrivate()
+				return changed.View()
+			}()},
+			{name: "tailnet lock history", incoming: func() persist.PersistView {
+				changed := identity.Clone()
+				changed.DisallowedTKAStateIDs = []string{"forbidden"}
+				return changed.View()
+			}()},
+			{name: "different stored identity", incoming: identity.View(), current: (&persist.Persist{
+				PrivateNodeKey: key.NewNode(),
+				NodeID:         identity.NodeID,
+			}).View()},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				err := newValidator(t, nm).ValidateControlStatus(nm, tt.incoming, tt.current, "", true)
+				if !errors.Is(err, ErrWaifusRepairRequired) {
+					t.Fatalf("ValidateControlStatus error = %v, want %v", err, ErrWaifusRepairRequired)
+				}
+			})
+		}
+	})
+
+	t.Run("rotation after acceptance", func(t *testing.T) {
+		nm, identity := newStatus()
+		validator := newValidator(t, nm)
+		if err := validator.ValidateControlStatus(nm, identity.View(), persist.PersistView{}, "", true); err != nil {
+			t.Fatalf("first ValidateControlStatus: %v", err)
+		}
+		rotated := cloneWaifusTestNetworkMap(nm)
+		rotatedIdentity := identity.Clone()
+		rotatedIdentity.PrivateNodeKey = key.NewNode()
+		self := rotated.SelfNode.AsStruct()
+		self.Key = rotatedIdentity.PrivateNodeKey.Public()
+		rotated.SelfNode = self.View()
+		rotated.NodeKey = self.Key
+		if err := validator.ValidateControlStatus(rotated, rotatedIdentity.View(), identity.View(), "", true); !errors.Is(err, ErrWaifusRepairRequired) {
+			t.Fatalf("rotated ValidateControlStatus error = %v, want %v", err, ErrWaifusRepairRequired)
+		}
+	})
+}
+
+func TestValidateWaifusStoredIdentity(t *testing.T) {
+	expected := &persist.Persist{
+		PrivateNodeKey: key.NewNode(),
+		NodeID:         "waifus-local",
+	}
+	tests := []struct {
+		name       string
+		current    *persist.Persist
+		initialize bool
+		wantErr    bool
+	}{
+		{name: "missing", initialize: true},
+		{name: "empty", current: new(persist.Persist), initialize: true},
+		{name: "matching", current: expected.Clone()},
+		{name: "metadata without node key", current: &persist.Persist{NodeID: expected.NodeID}, wantErr: true},
+		{name: "different key", current: &persist.Persist{PrivateNodeKey: key.NewNode(), NodeID: expected.NodeID}, wantErr: true},
+		{name: "rotation state", current: &persist.Persist{
+			PrivateNodeKey:    expected.PrivateNodeKey,
+			OldPrivateNodeKey: key.NewNode(),
+			NodeID:            expected.NodeID,
+		}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			initialize, err := validateWaifusStoredIdentity(tt.current, expected)
+			if initialize != tt.initialize {
+				t.Errorf("initialize = %v, want %v", initialize, tt.initialize)
+			}
+			if gotErr := errors.Is(err, ErrWaifusRepairRequired); gotErr != tt.wantErr {
+				t.Errorf("error = %v, repair_required = %v, want %v", err, gotErr, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestWaifusNetworkMapRejectedBeforeBackendMutation(t *testing.T) {
 	logf := logger.Discard
 	bus := eventbustest.NewBus(t)
@@ -343,6 +539,8 @@ func TestWaifusNetworkMapRejectedBeforeBackendMutation(t *testing.T) {
 
 	var client *mockControl
 	approved := true
+	selfNodePrivate := key.NewNode()
+	selfDiscoPrivate := key.NewDisco()
 	b, err := NewLocalBackend(
 		logf,
 		logid.PublicID{},
@@ -352,7 +550,14 @@ func TestWaifusNetworkMapRejectedBeforeBackendMutation(t *testing.T) {
 			client = newClient(t, opts)
 			return client, nil
 		}),
-		WithWaifusNetworkMapPolicy(WaifusNodeRoleRemote, waifusTestApplicationPort, func(WaifusPeerIdentity) bool { return approved }),
+		WithWaifusNetworkMapPolicy(
+			WaifusNodeRoleRemote,
+			waifusTestApplicationPort,
+			selfNodePrivate.Public(),
+			selfDiscoPrivate.Public(),
+			func(WaifusPeerIdentity) bool { return approved },
+		),
+		WithWaifusLocalIdentity(selfNodePrivate, "waifus-100.64.0.1/32"),
 	)
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
@@ -363,7 +568,9 @@ func TestWaifusNetworkMapRejectedBeforeBackendMutation(t *testing.T) {
 	}
 
 	invalid := validWaifusNetworkMap(1)
+	invalidPersist := bindWaifusTestPrivateIdentity(invalid, selfNodePrivate, selfDiscoPrivate)
 	invalid.DNS.Proxied = true
+	client.persist = invalidPersist
 	client.send(sendOpt{nm: invalid, loginFinished: true})
 
 	if got := b.NetMap(); got != nil {
@@ -377,6 +584,7 @@ func TestWaifusNetworkMapRejectedBeforeBackendMutation(t *testing.T) {
 	}
 
 	valid := validWaifusNetworkMap(1)
+	client.persist = bindWaifusTestPrivateIdentity(valid, selfNodePrivate, selfDiscoPrivate)
 	client.send(sendOpt{nm: valid, loginFinished: true})
 	if got := b.NetMap(); got == nil {
 		t.Fatal("valid pair-only map was not installed")
@@ -398,6 +606,48 @@ func TestWaifusNetworkMapRejectedBeforeBackendMutation(t *testing.T) {
 	approved = false
 	if _, ok := b.WaifusPeerAddress(peerKey); ok {
 		t.Fatal("WaifusPeerAddress resolved a dynamically revoked peer")
+	}
+
+	maliciousPeer := waifusTestNode(3, "100.64.0.3/32")
+	if handled := b.UpdateNetmapDelta([]netmap.NodeMutation{
+		netmap.NodeMutationUpsert{Node: maliciousPeer.View()},
+	}); handled {
+		t.Fatal("Waifus backend accepted an incremental peer mutation")
+	}
+	if got := b.NetMapWithPeers(); got == nil || len(got.Peers) != 1 {
+		t.Fatalf("peer count after rejected delta = %v, want 1", got)
+	}
+	if handled := b.UpdatePacketFilter(
+		views.SliceOf([]tailcfg.FilterRule{{}}),
+		[]filter.Match{{}},
+	); handled {
+		t.Fatal("Waifus backend accepted an incremental packet filter")
+	}
+	if handled := b.UpdateUserProfiles(map[tailcfg.UserID]tailcfg.UserProfileView{
+		1: (&tailcfg.UserProfile{ID: 1}).View(),
+	}); handled {
+		t.Fatal("Waifus backend accepted incremental user profiles")
+	}
+	b.PatchDiscoKey(peerKey, key.NewDisco().Public())
+	nodeBackend := b.currentNode()
+	nodeBackend.mu.Lock()
+	learnedDiscoCount := len(nodeBackend.tsmpLearnedDisco)
+	nodeBackend.mu.Unlock()
+	if learnedDiscoCount != 0 {
+		t.Fatalf("Waifus backend accepted %d out-of-band discovery-key patches", learnedDiscoCount)
+	}
+	revoked, err := b.RefreshWaifusPeerAuthorizations()
+	if err != nil {
+		t.Fatalf("RefreshWaifusPeerAuthorizations: %v", err)
+	}
+	if revoked != 1 {
+		t.Fatalf("revoked peers = %d, want 1", revoked)
+	}
+	if got := b.NetMapWithPeers(); got == nil || len(got.Peers) != 0 {
+		t.Fatalf("peer view after local revocation = %v, want empty map", got)
+	}
+	if revoked, err := b.RefreshWaifusPeerAuthorizations(); err != nil || revoked != 0 {
+		t.Fatalf("second authorization refresh = (%d, %v), want (0, nil)", revoked, err)
 	}
 }
 
@@ -453,6 +703,24 @@ func validWaifusNetworkMap(peerCount int) *netmap.NetworkMap {
 	return nm
 }
 
+func bindWaifusTestPrivateIdentity(nm *netmap.NetworkMap, privateKey key.NodePrivate, discoKey key.DiscoPrivate) *persist.Persist {
+	self := nm.SelfNode.AsStruct()
+	self.Key = privateKey.Public()
+	self.DiscoKey = discoKey.Public()
+	nm.SelfNode = self.View()
+	nm.NodeKey = self.Key
+	return &persist.Persist{
+		PrivateNodeKey: privateKey,
+		NodeID:         self.StableID,
+	}
+}
+
+func cloneWaifusTestNetworkMap(nm *netmap.NetworkMap) *netmap.NetworkMap {
+	clone := *nm
+	clone.Peers = append([]tailcfg.NodeView(nil), nm.Peers...)
+	return &clone
+}
+
 func waifusTestNode(id tailcfg.NodeID, address string) *tailcfg.Node {
 	prefix := netip.MustParsePrefix(address)
 	return &tailcfg.Node{
@@ -464,5 +732,6 @@ func waifusTestNode(id tailcfg.NodeID, address string) *tailcfg.Node {
 		AllowedIPs:        []netip.Prefix{prefix},
 		MachineAuthorized: true,
 		Cap:               tailcfg.CurrentCapabilityVersion,
+		Hostinfo:          new(tailcfg.Hostinfo).View(),
 	}
 }
