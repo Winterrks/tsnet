@@ -200,6 +200,66 @@ import (
 	"tailscale.com/wgengine/netstack"
 )
 
+var (
+	// ErrWaifusControlClientFactoryRequired reports that Waifus mode was
+	// selected without its explicit control-client factory.
+	ErrWaifusControlClientFactoryRequired = errors.New("Waifus control client factory is required")
+
+	// ErrWaifusControlProfile reports an unknown Waifus compiled control
+	// profile. Only production and staging are supported.
+	ErrWaifusControlProfile = errors.New("invalid Waifus control profile")
+
+	// ErrWaifusControlURLOverride reports an attempt to supply an arbitrary
+	// control URL to a Waifus-mode server.
+	ErrWaifusControlURLOverride = errors.New("Waifus control URL overrides are forbidden")
+)
+
+// WaifusControlProfile selects one of the control-plane profiles compiled
+// into the Waifus helper. It is not a URL or an extensible origin selector.
+type WaifusControlProfile uint8
+
+const (
+	// WaifusControlProduction selects pair.waifucave.com and is the default.
+	WaifusControlProduction WaifusControlProfile = 1
+
+	// WaifusControlStaging selects pair-staging.waifucave.com for explicit
+	// development and release validation.
+	WaifusControlStaging WaifusControlProfile = 2
+)
+
+const (
+	waifusProductionControlURL = "https://pair.waifucave.com"
+	waifusStagingControlURL    = "https://pair-staging.waifucave.com"
+)
+
+// WaifusControlClientFactory constructs the injected control client for one
+// immutable compiled profile.
+type WaifusControlClientFactory func(WaifusControlProfile, controlclient.Options) (controlclient.Client, error)
+
+// WaifusControlConfig enables the narrow Waifus control-client path. Profile
+// may be zero to select production. The complete config is copied before any
+// server or network initialization and cannot be changed after Start.
+type WaifusControlConfig struct {
+	Profile   WaifusControlProfile
+	NewClient WaifusControlClientFactory
+}
+
+type waifusControlSnapshot struct {
+	profile   WaifusControlProfile
+	newClient WaifusControlClientFactory
+}
+
+func (p WaifusControlProfile) controlURL() string {
+	switch p {
+	case WaifusControlProduction:
+		return waifusProductionControlURL
+	case WaifusControlStaging:
+		return waifusStagingControlURL
+	default:
+		panic("invalid Waifus control profile")
+	}
+}
+
 // Server is an embedded Tailscale server.
 //
 // Its exported fields may be changed until the first method call.
@@ -288,6 +348,11 @@ type Server struct {
 	// If that is also empty, the Tailscale default is used.
 	ControlURL string
 
+	// WaifusControl, when non-nil, enables the explicit Waifus control-client
+	// seam. Its factory and numeric compiled profile are snapshotted by Start.
+	// ControlURL and TS_CONTROL_URL are forbidden in this mode.
+	WaifusControl *WaifusControlConfig
+
 	// RunWebClient, if true, runs a client for managing this node over
 	// its Tailscale interface on port 5252.
 	RunWebClient bool
@@ -336,6 +401,7 @@ type Server struct {
 	dialer              *tsdial.Dialer
 	advertisedServices  map[tailcfg.ServiceName]int
 	closeOnce           sync.Once
+	waifusControl       *waifusControlSnapshot
 }
 
 // FallbackTCPHandler describes the callback which
@@ -669,10 +735,40 @@ func (s *Server) close() {
 }
 
 func (s *Server) doInit() {
+	waifusControl, err := s.snapshotWaifusControl()
+	if err != nil {
+		s.initErr = fmt.Errorf("tsnet: %w", err)
+		return
+	}
+	s.waifusControl = waifusControl
 	s.shutdownCtx, s.shutdownCancel = context.WithCancel(context.Background())
 	if err := s.start(); err != nil {
 		s.initErr = fmt.Errorf("tsnet: %w", err)
 	}
+}
+
+func (s *Server) snapshotWaifusControl() (*waifusControlSnapshot, error) {
+	config := s.WaifusControl
+	if config == nil {
+		return nil, nil
+	}
+	if config.NewClient == nil {
+		return nil, ErrWaifusControlClientFactoryRequired
+	}
+	if s.ControlURL != "" || os.Getenv("TS_CONTROL_URL") != "" {
+		return nil, ErrWaifusControlURLOverride
+	}
+	profile := config.Profile
+	if profile == 0 {
+		profile = WaifusControlProduction
+	}
+	if profile != WaifusControlProduction && profile != WaifusControlStaging {
+		return nil, fmt.Errorf("%w: %d", ErrWaifusControlProfile, profile)
+	}
+	return &waifusControlSnapshot{
+		profile:   profile,
+		newClient: config.NewClient,
+	}, nil
 }
 
 // CertDomains returns the list of domains for which the server can
@@ -730,6 +826,9 @@ func (s *Server) getAuthKey() string {
 }
 
 func (s *Server) getControlURL() string {
+	if s.waifusControl != nil {
+		return s.waifusControl.profile.controlURL()
+	}
 	if v := s.ControlURL; v != "" {
 		return v
 	}
@@ -929,7 +1028,19 @@ func (s *Server) start() (reterr error) {
 	if s.Ephemeral {
 		loginFlags = controlclient.LoginEphemeral
 	}
-	lb, err := ipnlocal.NewLocalBackend(tsLogf, s.logid, sys, loginFlags|controlclient.LocalBackendStartKeyOSNeutral)
+	var localBackendOptions []ipnlocal.LocalBackendOption
+	if waifusControl := s.waifusControl; waifusControl != nil {
+		localBackendOptions = append(localBackendOptions, ipnlocal.WithControlClientFactory(func(opts controlclient.Options) (controlclient.Client, error) {
+			return waifusControl.newClient(waifusControl.profile, opts)
+		}))
+	}
+	lb, err := ipnlocal.NewLocalBackend(
+		tsLogf,
+		s.logid,
+		sys,
+		loginFlags|controlclient.LocalBackendStartKeyOSNeutral,
+		localBackendOptions...,
+	)
 	if err != nil {
 		return fmt.Errorf("NewLocalBackend: %v", err)
 	}

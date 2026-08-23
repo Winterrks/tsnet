@@ -532,13 +532,58 @@ type serveLabels struct {
 // It's the type used by forTest.SetControlClientGetter.
 type clientGen func(controlclient.Options) (controlclient.Client, error)
 
+// ControlClientFactory constructs the control-plane client used by a
+// LocalBackend. The factory is fixed when the backend is constructed and is
+// used for every control-client generation during that backend's lifetime.
+type ControlClientFactory func(controlclient.Options) (controlclient.Client, error)
+
+// LocalBackendOption configures a LocalBackend at construction time.
+type LocalBackendOption interface {
+	applyLocalBackendOption(*localBackendOptions) error
+}
+
+type localBackendOptions struct {
+	controlClientFactory ControlClientFactory
+}
+
+type localBackendOptionFunc func(*localBackendOptions) error
+
+func (f localBackendOptionFunc) applyLocalBackendOption(opts *localBackendOptions) error {
+	return f(opts)
+}
+
+// WithControlClientFactory installs factory as the LocalBackend's immutable
+// production control-client construction seam. A nil factory is rejected.
+func WithControlClientFactory(factory ControlClientFactory) LocalBackendOption {
+	return localBackendOptionFunc(func(opts *localBackendOptions) error {
+		if factory == nil {
+			return errors.New("nil control client factory")
+		}
+		if opts.controlClientFactory != nil {
+			return errors.New("control client factory already configured")
+		}
+		opts.controlClientFactory = factory
+		return nil
+	})
+}
+
 // NewLocalBackend returns a new LocalBackend that is ready to run,
 // but is not actually running.
 //
 // If dialer is nil, a new one is made.
 //
 // The logID may be the zero value if logging is not in use.
-func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, loginFlags controlclient.LoginFlags) (_ *LocalBackend, err error) {
+func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, loginFlags controlclient.LoginFlags, options ...LocalBackendOption) (_ *LocalBackend, err error) {
+	var constructorOptions localBackendOptions
+	for _, option := range options {
+		if option == nil {
+			return nil, errors.New("nil LocalBackend option")
+		}
+		if err := option.applyLocalBackendOption(&constructorOptions); err != nil {
+			return nil, fmt.Errorf("applying LocalBackend option: %w", err)
+		}
+	}
+
 	e := sys.Engine.Get()
 	store := sys.StateStore.Get()
 	dialer := sys.Dialer.Get()
@@ -603,6 +648,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		em:           newExpiryManager(logf, sys.Bus.Get()),
 		loginFlags:   loginFlags,
 		clock:        clock,
+		ccGen:        clientGen(constructorOptions.controlClientFactory),
 	}
 
 	sys.NoiseRoundTripper.Set(noiseRoundTripper{b})
