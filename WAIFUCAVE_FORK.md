@@ -44,6 +44,30 @@ result; the build never falls back to a relay.
 Waifus mode accepts only pair-isolated maps, pins node/discovery identities and
 overlay addresses for the process lifetime, synthesizes its own TCP filter for
 one immutable application port, and exposes no generic address or port dialer.
+The private helper supplies the node private key, stable node ID, and discovery
+private key before engine construction. Empty local state is initialized from
+that identity; missing, corrupt, rotated, or mismatched state fails with
+`repair_required` and is never silently regenerated. Engine reconfiguration
+may temporarily clear the node key to stop after a rejected map, but only the
+original helper-owned key can be restored.
+
+The injected client contract uses successful full-map status envelopes only.
+Interactive login URLs, map-less successful status, incremental peer/filter/
+profile updates, and out-of-band discovery-key patches are rejected. Every
+node carries a valid empty `Hostinfo` object; any populated host metadata is
+forbidden. A full valid map is also the direct rendezvous signal: newly
+advertised endpoints are proactively probed, while the existing rate limiter
+suppresses redundant probes. This replaces the DERP `CallMeMaybe` path without
+adding another relay or long-lived coordination data path.
+
+Both accepted and dialed application streams are bound to the exact approved
+peer key. `RefreshWaifusPeerAuthorizations` re-evaluates the local authorizer
+without coordination, denies new flows immediately, closes revoked streams,
+allows a bounded close-packet drain while the WireGuard route still exists,
+and only then removes the peer. Other approved pair edges remain installed.
+An approved peer that cannot establish direct UDP before the caller's deadline
+returns `ErrWaifusDirectUnavailable`; no relay attempt follows.
+
 Public endpoint discovery uses one immutable IP-literal STUN destination. The
 fork supplies that endpoint to netcheck through a transient STUN-only descriptor;
 it is never installed as a DERP map, and send-time enforcement rejects every
@@ -53,6 +77,43 @@ candidates remain available for NAT traversal and network mobility.
 Ordinary upstream behavior outside Waifus mode must remain unchanged. Runtime
 counters and packet ledgers are regression evidence, not the enforcement
 boundary.
+
+## Helper-facing delta
+
+The intentionally added public seams are:
+
+- `tsnet.WaifusControlConfig`, the two-value control profile enum, immutable
+  helper-owned transport identity, fixed application port, local pair
+  authorizer, and injected client factory.
+- `tsnet.Server.DialWaifusPeer` and
+  `tsnet.Server.RefreshWaifusPeerAuthorizations`, the only Waifus-specific
+  dial and offline-revocation operations.
+- `ipnlocal.WithControlClientFactory`,
+  `ipnlocal.WithWaifusNetworkMapPolicy`, and
+  `ipnlocal.WithWaifusLocalIdentity`, which are construction-only backend
+  options.
+- `wgengine.Config.DirectOnly`, its fixed STUN/node/discovery identity fields,
+  and `magicsock.DirectOnlyCounters`, which carry and audit the structural
+  policy below tsnet.
+- `magicsock.Conn.RebindToNewPort`, a recovery/test hook that intentionally
+  requests a fresh UDP socket tuple when no preferred port is configured and
+  otherwise honors that explicit port. Callers follow it with `ReSTUN`.
+
+The public fake coordinator in `tstest/waifuscontrol` and the
+`cmd/waifus-direct-spike` tests exercise production and staging construction,
+host-plus-two-remotes isolation, malicious maps, concurrent authenticated
+streams, four-direction endpoint migration, offline revoke-one behavior, and
+the typed hard-unavailable result. On Linux, the mandatory namespace matrix
+adds an isolated loopback-only network, netem impairment, and packet capture:
+
+```text
+go test -tags=waifus_direct_only ./cmd/waifus-direct-spike ./tstest/waifuscontrol
+sudo -n ./tool/waifus-spike/run-netns-matrix.sh
+```
+
+The packet gate requires observed STUN, discovery, and encrypted direct UDP,
+and rejects outer TCP, DNS, or non-loopback egress. It cannot be closed by a
+compile-only result.
 
 ## Public/private boundary
 
