@@ -950,7 +950,24 @@ func (c *Conn) InstallCaptureHook(cb packet.CaptureCallback) {
 
 // doPeriodicSTUN is called (in a new goroutine) by
 // periodicReSTUNTimer when periodic STUNs are active.
-func (c *Conn) doPeriodicSTUN() { c.ReSTUN("periodic") }
+func (c *Conn) doPeriodicSTUN() {
+	// STUN keeps the server-reflexive address current, but does not open a
+	// destination-specific NAT mapping to a peer. Without DERP CallMeMaybe,
+	// both sides must retry direct discovery even when the endpoint set is
+	// unchanged and neither side has sent application traffic yet.
+	c.mu.Lock()
+	if c.directOnly && !c.closed && c.shouldDoPeriodicReSTUNLocked() {
+		c.peerMap.forEachEndpoint(func(ep *endpoint) {
+			ep.mu.Lock()
+			defer ep.mu.Unlock()
+			if !ep.expired {
+				ep.sendDiscoPingsLocked(mono.Now(), false)
+			}
+		})
+	}
+	c.mu.Unlock()
+	c.ReSTUN("periodic")
+}
 
 func (c *Conn) stopPeriodicReSTUNTimerLocked() {
 	if t := c.periodicReSTUNTimer; t != nil {
@@ -3865,6 +3882,13 @@ func (c *Conn) shouldDoPeriodicReSTUNLocked() bool {
 		// If no peers, not worth doing.
 		// Also don't if there's no key (not running).
 		return false
+	}
+	if c.directOnly {
+		// Direct-only peers have no DERP CallMeMaybe channel to restart
+		// discovery when an idle NAT mapping expires. Keep the existing
+		// bounded, configured-STUN-only refresh active while peers are
+		// authorized; offline, homeless and keyless instances still stop above.
+		return true
 	}
 	if f := c.idleFunc; f != nil {
 		idleFor := f()

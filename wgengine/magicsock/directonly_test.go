@@ -6,8 +6,10 @@
 package magicsock
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tailscale/wireguard-go/conn"
+	"tailscale.com/disco"
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
@@ -157,6 +160,177 @@ func TestDirectOnlyAdvertisesLocalEndpointsWithoutSTUN(t *testing.T) {
 	}
 	if len(c.lastEndpoints) != 1 || c.lastEndpoints[0] != local[0] {
 		t.Fatalf("stored endpoints = %v, want %v", c.lastEndpoints, local)
+	}
+}
+
+func TestDirectOnlyKeepsApprovedSTUNCandidatesFreshWhileIdle(t *testing.T) {
+	c := newDirectOnlyTestConn(t)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.checkNetworkUpDuringTests = true
+	c.privateKey = key.NewNode()
+	c.peersByID = map[tailcfg.NodeID]tailcfg.NodeView{1: directOnlyTestNode(1, 0, false, "100.64.0.2/32")}
+	c.idleFunc = func() time.Duration { return time.Hour }
+	if !c.shouldDoPeriodicReSTUNLocked() {
+		t.Fatal("direct-only discovery stopped during idle with an authorized peer and no DERP wake-up path")
+	}
+	c.networkUp.Store(false)
+	if c.shouldDoPeriodicReSTUNLocked() {
+		t.Fatal("offline connection kept STUN active")
+	}
+	c.networkUp.Store(true)
+	privateKey := c.privateKey
+	c.privateKey = key.NodePrivate{}
+	if c.shouldDoPeriodicReSTUNLocked() {
+		t.Fatal("keyless connection kept STUN active")
+	}
+	c.privateKey = privateKey
+	peers := c.peersByID
+	c.peersByID = nil
+	if c.shouldDoPeriodicReSTUNLocked() {
+		t.Fatal("unpaired connection kept STUN active")
+	}
+	c.peersByID = peers
+	c.directOnly = false
+	if c.shouldDoPeriodicReSTUNLocked() {
+		t.Fatal("ordinary Tailscale idle behavior changed")
+	}
+	c.directOnly = true
+}
+
+func TestDirectOnlyPeriodicDiscoveryRetriesIdlePeer(t *testing.T) {
+	c := newDirectOnlyTestConn(t)
+	self := directOnlyTestNode(1, 0, false, "100.64.0.1/32")
+	peer := directOnlyTestNode(2, 0, false, "100.64.0.2/32")
+	if err := c.SetNetworkMap(self, []tailcfg.NodeView{peer}); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	c.privateKey = c.directOnlyNodeKey
+	c.checkNetworkUpDuringTests = true
+	c.networkUp.Store(true)
+	ep, ok := c.peerMap.endpointForNodeKey(peer.Key())
+	if !ok {
+		c.mu.Unlock()
+		t.Fatal("missing authorized peer")
+	}
+	ep.mu.Lock()
+	ep.lastFullPing = 0
+	ep.mu.Unlock()
+	c.mu.Unlock()
+	c.doPeriodicSTUN()
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+	if ep.lastFullPing.IsZero() {
+		t.Fatal("idle peer was not reprobed by periodic discovery")
+	}
+	if !ep.lastSendExt.IsZero() {
+		t.Fatal("periodic discovery pretended to be application traffic")
+	}
+}
+
+func TestDirectOnlyPeriodicDiscoverySendsRateLimitedDirectPacket(t *testing.T) {
+	sink, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sink.Close() })
+	c := newDirectOnlyTestConn(t)
+	if _, _, err := c.bind.Open(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetPrivateKey(c.directOnlyNodeKey); err != nil {
+		t.Fatal(err)
+	}
+	self := directOnlyTestNode(1, 0, false, "100.64.0.1/32")
+	peerNode := directOnlyTestNode(2, 0, false, "100.64.0.2/32").AsStruct()
+	address := sink.LocalAddr().(*net.UDPAddr).AddrPort()
+	peerNode.Endpoints = []netip.AddrPort{address}
+	peer := peerNode.View()
+	if err := c.SetNetworkMap(self, []tailcfg.NodeView{peer}); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 2048)
+	readProbe := func() {
+		t.Helper()
+		sink.SetReadDeadline(time.Now().Add(time.Second))
+		n, _, err := sink.ReadFromUDPAddrPort(buffer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.HasPrefix(buffer[:n], []byte(disco.Magic)) {
+			t.Fatal("not an encrypted direct discovery packet")
+		}
+	}
+	readProbe()
+	c.mu.Lock()
+	ep, _ := c.peerMap.endpointForNodeKey(peer.Key())
+	ep.mu.Lock()
+	ep.endpointState[address].lastPing = mono.Now().Add(-discoPingInterval)
+	ep.mu.Unlock()
+	c.mu.Unlock()
+	c.doPeriodicSTUN()
+	readProbe()
+	c.doPeriodicSTUN()
+	sink.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if _, _, err := sink.ReadFromUDPAddrPort(buffer); err == nil {
+		t.Fatal("immediate retry bypassed per-endpoint rate limit")
+	}
+	if counters := c.DirectOnlyCounters(); counters != (DirectOnlyCounters{}) {
+		t.Fatalf("forbidden transport attempted: %+v", counters)
+	}
+}
+
+func TestDirectOnlyPeriodicDiscoveryStopsOutsideAuthorizedOnlineSession(t *testing.T) {
+	for _, mode := range []string{"ordinary", "offline", "keyless", "homeless", "expired", "removed", "closed"} {
+		t.Run(mode, func(t *testing.T) {
+			c := newDirectOnlyTestConn(t)
+			self := directOnlyTestNode(1, 0, false, "100.64.0.1/32")
+			peer := directOnlyTestNode(2, 0, false, "100.64.0.2/32")
+			if err := c.SetNetworkMap(self, []tailcfg.NodeView{peer}); err != nil {
+				t.Fatal(err)
+			}
+			c.mu.Lock()
+			c.privateKey = c.directOnlyNodeKey
+			c.checkNetworkUpDuringTests = true
+			c.networkUp.Store(true)
+			ep, _ := c.peerMap.endpointForNodeKey(peer.Key())
+			ep.mu.Lock()
+			ep.lastFullPing = 0
+			if mode == "expired" {
+				ep.expired = true
+			}
+			ep.mu.Unlock()
+			switch mode {
+			case "ordinary":
+				c.directOnly = false
+			case "offline":
+				c.networkUp.Store(false)
+			case "keyless":
+				c.privateKey = key.NodePrivate{}
+			case "homeless":
+				c.homeless = true
+			}
+			c.mu.Unlock()
+			if mode == "removed" {
+				if err := c.SetNetworkMap(self, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "closed" {
+				c.Close()
+			}
+			c.doPeriodicSTUN()
+			ep.mu.Lock()
+			probed := !ep.lastFullPing.IsZero()
+			ep.mu.Unlock()
+			c.mu.Lock()
+			c.directOnly = true
+			c.mu.Unlock()
+			if probed {
+				t.Fatal("periodic discovery probed an ineligible peer")
+			}
+		})
 	}
 }
 

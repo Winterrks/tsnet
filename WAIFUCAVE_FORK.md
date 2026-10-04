@@ -74,6 +74,15 @@ it is never installed as a DERP map, and send-time enforcement rejects every
 other netcheck destination. LAN gateway port mapping and validated direct peer
 candidates remain available for NAT traversal and network mobility.
 
+While a direct-only instance has an authorized peer, a node key, and an online
+network, its existing randomized 20–26-second STUN refresh remains active during
+application idle. Each periodic refresh also retries authenticated discovery to
+the peer's known direct candidates, subject to the existing per-endpoint rate
+limit. STUN alone does not open destination-specific NAT mappings to that peer.
+This bounded retry replaces the missing idle DERP wake-up path; it sends no
+application payload or extra coordination message. Removed/expired peers are not
+probed, and offline, homeless, keyless, or closed instances stop probing.
+
 Ordinary upstream behavior outside Waifus mode must remain unchanged. Runtime
 counters and packet ledgers are regression evidence, not the enforcement
 boundary.
