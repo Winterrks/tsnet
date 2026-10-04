@@ -53,7 +53,13 @@ jobs:
 
           upstream_commit="$(lock_value upstream_commit)"
           upstream_tag="$(lock_value upstream_tag)"
-          test "$(git rev-parse "refs/tags/${upstream_tag}^{}")" = "$upstream_commit"
+          # The maintained fork need not mirror upstream's tag namespace.
+          # Fetch only this locked tag from the locked upstream repository,
+          # into a non-tag local ref, then verify its exact peeled commit.
+          upstream_ref="refs/waifucave/upstream/${upstream_tag}"
+          git fetch --no-tags https://github.com/tailscale/tailscale.git \
+            "refs/tags/${upstream_tag}:${upstream_ref}"
+          test "$(git rev-parse "${upstream_ref}^{}")" = "$upstream_commit"
           git merge-base --is-ancestor "$upstream_commit" HEAD
       - name: Check source licenses
         run: go test -run=TestLicenseHeaders .
