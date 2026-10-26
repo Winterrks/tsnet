@@ -196,7 +196,7 @@ func TestWaifusControlFactoryErrorHasNoStockFallback(t *testing.T) {
 		WaifusControl: &WaifusControlConfig{
 			Role:            WaifusNodeRoleRemote,
 			ApplicationPort: waifusRestrictedApplicationPort,
-			STUNEndpoint:    netip.MustParseAddrPort("127.0.0.1:3478"),
+			STUNEndpoints:   []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:3478")},
 			NodePrivateKey:  nodePrivate,
 			StableNodeID:    "factory-error",
 			DiscoPrivateKey: key.NewDisco(),

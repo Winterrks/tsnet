@@ -418,7 +418,7 @@ func newSpikeServer(
 			Profile:         profile,
 			Role:            role,
 			ApplicationPort: spikeApplicationPort,
-			STUNEndpoint:    stunEndpoint,
+			STUNEndpoints:   []netip.AddrPort{stunEndpoint},
 			NodePrivateKey:  node.NodePrivateKey,
 			StableNodeID:    node.StableID,
 			DiscoPrivateKey: node.DiscoPrivateKey,

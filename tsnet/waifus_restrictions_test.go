@@ -9,11 +9,13 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"slices"
 	"testing"
 
 	"tailscale.com/control/controlclient"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/types/key"
+	"tailscale.com/wgengine/magicsock"
 )
 
 const waifusRestrictedApplicationPort uint16 = 43111
@@ -58,7 +60,7 @@ func TestWaifusControlRequiresRoleAndPeerAuthorizer(t *testing.T) {
 	s = &Server{WaifusControl: &WaifusControlConfig{
 		Role:            WaifusNodeRoleRemote,
 		ApplicationPort: waifusRestrictedApplicationPort,
-		STUNEndpoint:    netip.MustParseAddrPort("127.0.0.1:3478"),
+		STUNEndpoints:   []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:3478")},
 		AuthorizePeer:   func(WaifusPeerIdentity) bool { return true },
 		NewClient:       newClient,
 	}}
@@ -68,22 +70,32 @@ func TestWaifusControlRequiresRoleAndPeerAuthorizer(t *testing.T) {
 }
 
 func TestWaifusControlRejectsUnsafeSTUNEndpointBeforeInitialization(t *testing.T) {
+	safe := netip.MustParseAddrPort("192.0.2.20:3478")
+	tooMany := make([]netip.AddrPort, 0, magicsock.MaxDirectSTUNEndpoints+1)
+	for index := range magicsock.MaxDirectSTUNEndpoints + 1 {
+		tooMany = append(tooMany, netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, byte(index + 1)}), 3478))
+	}
 	tests := []struct {
-		name     string
-		endpoint netip.AddrPort
+		name      string
+		endpoints []netip.AddrPort
 	}{
 		{name: "missing"},
-		{name: "zero port", endpoint: netip.MustParseAddrPort("192.0.2.10:0")},
-		{name: "unspecified", endpoint: netip.MustParseAddrPort("0.0.0.0:3478")},
-		{name: "multicast", endpoint: netip.MustParseAddrPort("224.0.0.1:3478")},
-		{name: "overlay", endpoint: netip.MustParseAddrPort("100.64.0.2:3478")},
-		{name: "DERP magic IP", endpoint: netip.MustParseAddrPort("127.3.3.40:3478")},
-		{name: "IPv4-mapped IPv6", endpoint: netip.MustParseAddrPort("[::ffff:192.0.2.10]:3478")},
+		{name: "empty", endpoints: []netip.AddrPort{}},
+		{name: "invalid", endpoints: []netip.AddrPort{{}}},
+		{name: "zero port", endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.10:0")}},
+		{name: "unspecified", endpoints: []netip.AddrPort{netip.MustParseAddrPort("0.0.0.0:3478")}},
+		{name: "multicast", endpoints: []netip.AddrPort{netip.MustParseAddrPort("224.0.0.1:3478")}},
+		{name: "overlay", endpoints: []netip.AddrPort{netip.MustParseAddrPort("100.64.0.2:3478")}},
+		{name: "DERP magic IP", endpoints: []netip.AddrPort{netip.MustParseAddrPort("127.3.3.40:3478")}},
+		{name: "IPv4-mapped IPv6", endpoints: []netip.AddrPort{netip.MustParseAddrPort("[::ffff:192.0.2.10]:3478")}},
+		{name: "unsafe after safe", endpoints: []netip.AddrPort{safe, netip.MustParseAddrPort("100.64.0.2:3478")}},
+		{name: "duplicate", endpoints: []netip.AddrPort{safe, safe}},
+		{name: "too many", endpoints: tooMany},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			config := waifusRestrictedTestConfig()
-			config.STUNEndpoint = tt.endpoint
+			config.STUNEndpoints = tt.endpoints
 			s := &Server{WaifusControl: config}
 			if err := s.Start(); !errors.Is(err, ErrWaifusSTUNEndpoint) {
 				t.Fatalf("Start error = %v, want %v", err, ErrWaifusSTUNEndpoint)
@@ -235,12 +247,28 @@ func TestWaifusModeBuildsOnlyOneApplicationListener(t *testing.T) {
 	}
 }
 
+func TestWaifusControlSnapshotsSTUNEndpointList(t *testing.T) {
+	config := waifusRestrictedTestConfig()
+	first := netip.MustParseAddrPort("192.0.2.30:3478")
+	second := netip.MustParseAddrPort("198.51.100.30:19302")
+	config.STUNEndpoints = []netip.AddrPort{first, second}
+	s := &Server{WaifusControl: config}
+	snapshot, err := s.snapshotWaifusControl()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	config.STUNEndpoints[0] = netip.MustParseAddrPort("203.0.113.30:3478")
+	if want := []netip.AddrPort{first, second}; !slices.Equal(snapshot.stunEndpoints, want) {
+		t.Fatalf("snapshot STUN endpoints = %v, want %v", snapshot.stunEndpoints, want)
+	}
+}
+
 func waifusRestrictedTestConfig() *WaifusControlConfig {
 	nodePrivate := key.NewNode()
 	return &WaifusControlConfig{
 		Role:            WaifusNodeRoleRemote,
 		ApplicationPort: waifusRestrictedApplicationPort,
-		STUNEndpoint:    netip.MustParseAddrPort("127.0.0.1:3478"),
+		STUNEndpoints:   []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:3478")},
 		NodePrivateKey:  nodePrivate,
 		StableNodeID:    "restricted-test",
 		DiscoPrivateKey: key.NewDisco(),

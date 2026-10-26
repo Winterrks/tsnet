@@ -26,7 +26,7 @@ func TestWaifusControlRequiresDirectOnlyBuild(t *testing.T) {
 		WaifusControl: &WaifusControlConfig{
 			Role:            WaifusNodeRoleRemote,
 			ApplicationPort: 43111,
-			STUNEndpoint:    netip.MustParseAddrPort("127.0.0.1:3478"),
+			STUNEndpoints:   []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:3478")},
 			NodePrivateKey:  nodePrivate,
 			StableNodeID:    "untagged-test",
 			DiscoPrivateKey: key.NewDisco(),

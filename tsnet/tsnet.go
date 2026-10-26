@@ -199,6 +199,7 @@ import (
 	"tailscale.com/util/set"
 	"tailscale.com/util/testenv"
 	"tailscale.com/wgengine"
+	"tailscale.com/wgengine/magicsock"
 	"tailscale.com/wgengine/netstack"
 )
 
@@ -224,9 +225,9 @@ var (
 	// ErrWaifusApplicationPort reports a missing fixed application service port.
 	ErrWaifusApplicationPort = errors.New("Waifus application port is required")
 
-	// ErrWaifusSTUNEndpoint reports a missing or unsafe immutable STUN
-	// destination.
-	ErrWaifusSTUNEndpoint = errors.New("valid Waifus STUN endpoint is required")
+	// ErrWaifusSTUNEndpoint reports a missing, oversized, duplicated, or
+	// unsafe immutable STUN destination list.
+	ErrWaifusSTUNEndpoint = errors.New("valid Waifus STUN endpoint list is required")
 
 	// ErrWaifusTransportIdentity reports missing immutable node/discovery keys
 	// owned by the embedding helper.
@@ -289,11 +290,15 @@ type WaifusPeerAuthorizer = ipnlocal.WaifusPeerAuthorizer
 // WaifusControlConfig enables the narrow Waifus control-client path. Profile
 // may be zero to select production. The complete config is copied before any
 // server or network initialization and cannot be changed after Start.
+//
+// STUNEndpoints is the fixed list of one to [magicsock.MaxDirectSTUNEndpoints]
+// distinct IP-literal STUN destinations. Every destination is probed on each
+// endpoint refresh; no other netcheck destination is ever contacted.
 type WaifusControlConfig struct {
 	Profile         WaifusControlProfile
 	Role            WaifusNodeRole
 	ApplicationPort uint16
-	STUNEndpoint    netip.AddrPort
+	STUNEndpoints   []netip.AddrPort
 	NodePrivateKey  key.NodePrivate
 	StableNodeID    tailcfg.StableNodeID
 	DiscoPrivateKey key.DiscoPrivate
@@ -305,7 +310,7 @@ type waifusControlSnapshot struct {
 	profile         WaifusControlProfile
 	role            WaifusNodeRole
 	applicationPort uint16
-	stunEndpoint    netip.AddrPort
+	stunEndpoints   []netip.AddrPort
 	nodePrivateKey  key.NodePrivate
 	stableNodeID    tailcfg.StableNodeID
 	discoPrivateKey key.DiscoPrivate
@@ -997,7 +1002,7 @@ func (s *Server) snapshotWaifusControl() (*waifusControlSnapshot, error) {
 	if config.ApplicationPort == 0 {
 		return nil, ErrWaifusApplicationPort
 	}
-	if !validWaifusSTUNEndpoint(config.STUNEndpoint) {
+	if !validWaifusSTUNEndpoints(config.STUNEndpoints) {
 		return nil, ErrWaifusSTUNEndpoint
 	}
 	if config.NodePrivateKey.IsZero() || config.StableNodeID == "" || config.DiscoPrivateKey.IsZero() {
@@ -1010,7 +1015,7 @@ func (s *Server) snapshotWaifusControl() (*waifusControlSnapshot, error) {
 		profile:         profile,
 		role:            config.Role,
 		applicationPort: config.ApplicationPort,
-		stunEndpoint:    config.STUNEndpoint,
+		stunEndpoints:   slices.Clone(config.STUNEndpoints),
 		nodePrivateKey:  config.NodePrivateKey,
 		stableNodeID:    config.StableNodeID,
 		discoPrivateKey: config.DiscoPrivateKey,
@@ -1024,6 +1029,18 @@ func validWaifusSTUNEndpoint(endpoint netip.AddrPort) bool {
 	return endpoint.IsValid() && endpoint.Port() != 0 && !address.Is4In6() &&
 		!address.IsUnspecified() && !address.IsMulticast() &&
 		address != tailcfg.DerpMagicIPAddr && !tsaddr.IsTailscaleIP(address)
+}
+
+func validWaifusSTUNEndpoints(endpoints []netip.AddrPort) bool {
+	if len(endpoints) == 0 || len(endpoints) > magicsock.MaxDirectSTUNEndpoints {
+		return false
+	}
+	for index, endpoint := range endpoints {
+		if !validWaifusSTUNEndpoint(endpoint) || slices.Contains(endpoints[:index], endpoint) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) forbiddenWaifusRuntimeConfiguration() string {
@@ -1255,29 +1272,29 @@ func (s *Server) start() (reterr error) {
 
 	s.dialer = &tsdial.Dialer{Logf: tsLogf} // mutated below (before used)
 	s.dialer.SetBus(sys.Bus.Get())
-	var directSTUNEndpoint netip.AddrPort
+	var directSTUNEndpoints []netip.AddrPort
 	var forceNodeKey key.NodePrivate
 	var forceDiscoKey key.DiscoPrivate
 	if s.waifusControl != nil {
-		directSTUNEndpoint = s.waifusControl.stunEndpoint
+		directSTUNEndpoints = slices.Clone(s.waifusControl.stunEndpoints)
 		forceNodeKey = s.waifusControl.nodePrivateKey
 		forceDiscoKey = s.waifusControl.discoPrivateKey
 	}
 	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
-		DirectOnly:         s.waifusControl != nil,
-		DirectSTUNEndpoint: directSTUNEndpoint,
-		ForceNodeKey:       forceNodeKey,
-		ForceDiscoKey:      forceDiscoKey,
-		Tun:                s.Tun,
-		EventBus:           sys.Bus.Get(),
-		ListenPort:         s.Port,
-		NetMon:             s.netMon,
-		Dialer:             s.dialer,
-		SetSubsystem:       sys.Set,
-		ControlKnobs:       sys.ControlKnobs(),
-		HealthTracker:      sys.HealthTracker.Get(),
-		ExtraRootCAs:       sys.ExtraRootCAs,
-		Metrics:            sys.UserMetricsRegistry(),
+		DirectOnly:          s.waifusControl != nil,
+		DirectSTUNEndpoints: directSTUNEndpoints,
+		ForceNodeKey:        forceNodeKey,
+		ForceDiscoKey:       forceDiscoKey,
+		Tun:                 s.Tun,
+		EventBus:            sys.Bus.Get(),
+		ListenPort:          s.Port,
+		NetMon:              s.netMon,
+		Dialer:              s.dialer,
+		SetSubsystem:        sys.Set,
+		ControlKnobs:        sys.ControlKnobs(),
+		HealthTracker:       sys.HealthTracker.Get(),
+		ExtraRootCAs:        sys.ExtraRootCAs,
+		Metrics:             sys.UserMetricsRegistry(),
 	})
 	if err != nil {
 		return err

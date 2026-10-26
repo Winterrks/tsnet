@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"slices"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/stun"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
@@ -32,10 +34,54 @@ import (
 )
 
 func TestDirectOnlyRequiresConfiguredSTUNEndpoint(t *testing.T) {
+	safe := netip.MustParseAddrPort("192.0.2.10:3478")
+	tooMany := make([]netip.AddrPort, 0, MaxDirectSTUNEndpoints+1)
+	for index := range MaxDirectSTUNEndpoints + 1 {
+		tooMany = append(tooMany, netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, byte(index + 1)}), 3478))
+	}
+	for name, endpoints := range map[string][]netip.AddrPort{
+		"missing":       nil,
+		"empty":         {},
+		"invalid":       {{}},
+		"unsafe member": {safe, netip.MustParseAddrPort("100.64.0.2:3478")},
+		"duplicate":     {safe, safe},
+		"too many":      tooMany,
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := directOnlyTestOptions(t)
+			opts.DirectSTUNEndpoints = endpoints
+			if _, err := NewConn(opts); !errors.Is(err, ErrDirectOnlySTUNEndpoint) {
+				t.Fatalf("NewConn error = %v, want %v", err, ErrDirectOnlySTUNEndpoint)
+			}
+		})
+	}
+	t.Run("ordinary mode", func(t *testing.T) {
+		opts := directOnlyTestOptions(t)
+		opts.DirectOnly = false
+		opts.ForceNodeKey = key.NodePrivate{}
+		if c, err := NewConn(opts); err == nil {
+			c.Close()
+			t.Fatal("ordinary Conn accepted direct-only STUN endpoints")
+		}
+	})
+}
+
+func TestDirectOnlyCopiesSTUNEndpointList(t *testing.T) {
+	first := netip.MustParseAddrPort("127.0.0.1:3478")
+	second := netip.MustParseAddrPort("127.0.0.1:19302")
 	opts := directOnlyTestOptions(t)
-	opts.DirectSTUNEndpoint = netip.AddrPort{}
-	if _, err := NewConn(opts); !errors.Is(err, ErrDirectOnlySTUNEndpoint) {
-		t.Fatalf("NewConn error = %v, want %v", err, ErrDirectOnlySTUNEndpoint)
+	opts.DirectSTUNEndpoints = []netip.AddrPort{first, second}
+	c, err := NewConn(opts)
+	if err != nil {
+		t.Fatalf("NewConn: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	opts.DirectSTUNEndpoints[0] = netip.MustParseAddrPort("127.0.0.1:9")
+	if !c.directOnlySTUNEndpointAllowed(first) || !c.directOnlySTUNEndpointAllowed(second) {
+		t.Fatal("configured STUN endpoints changed after the caller mutated its slice")
+	}
+	if _, err := c.sendUDPNetcheck([]byte("forbidden"), netip.MustParseAddrPort("127.0.0.1:9")); !errors.Is(err, ErrDirectOnlyEgress) {
+		t.Fatalf("sendUDPNetcheck to caller-mutated destination error = %v, want %v", err, ErrDirectOnlyEgress)
 	}
 }
 
@@ -104,12 +150,106 @@ func TestDirectOnlyPinsForcedDiscoveryKey(t *testing.T) {
 	}
 }
 
-func TestDirectOnlySTUNUsesOnlyConfiguredDestinationWithoutDERP(t *testing.T) {
-	stunAddr, cleanup := stuntest.Serve(t)
-	t.Cleanup(cleanup)
-	stunEndpoint := netip.MustParseAddrPort(stunAddr.String())
+func TestDirectOnlySTUNUsesOnlyConfiguredDestinationsWithoutDERP(t *testing.T) {
+	var stunEndpoints []netip.AddrPort
+	for range 2 {
+		stunAddr, cleanup := stuntest.Serve(t)
+		t.Cleanup(cleanup)
+		stunEndpoints = append(stunEndpoints, netip.MustParseAddrPort(stunAddr.String()))
+	}
+	c := newDirectOnlySTUNTestConn(t, stunEndpoints)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	report, err := c.updateNetInfo(ctx)
+	if err != nil {
+		t.Fatalf("updateNetInfo: %v", err)
+	}
+	if !report.UDP {
+		t.Fatal("configured STUN endpoints did not produce a UDP report")
+	}
+	if len(report.RegionLatency) != len(stunEndpoints) {
+		t.Fatalf("STUN regions answered = %v, want all %d configured destinations", report.RegionLatency, len(stunEndpoints))
+	}
+	if c.derpMap != nil || c.derpMapAtomic.Load() != nil {
+		t.Fatal("direct-only STUN installed a DERP map")
+	}
+
+	forbidden := netip.AddrPortFrom(stunEndpoints[0].Addr(), stunEndpoints[0].Port()+1)
+	for slices.Contains(stunEndpoints, forbidden) {
+		forbidden = netip.AddrPortFrom(forbidden.Addr(), forbidden.Port()+1)
+	}
+	if _, err := c.sendUDPNetcheck([]byte("forbidden"), forbidden); !errors.Is(err, ErrDirectOnlyEgress) {
+		t.Fatalf("sendUDPNetcheck error = %v, want %v", err, ErrDirectOnlyEgress)
+	}
+	if got := c.DirectOnlyCounters(); got != (DirectOnlyCounters{EgressAttempts: 1}) {
+		t.Fatalf("direct-only counters = %+v, want exactly one prohibited egress attempt", got)
+	}
+}
+
+// TestDirectOnlyAdvertisesEveryPerDestinationPublicAddress models a NAT that
+// preserves the mapped port but picks the public IPv4 address per destination
+// from a pool. Each address is seen by only one STUN destination, so upstream
+// GetGlobalAddrs would keep just the first; direct-only must advertise all of
+// them, on every refresh, without touching any non-configured destination.
+func TestDirectOnlyAdvertisesEveryPerDestinationPublicAddress(t *testing.T) {
+	const mappedPort = 41641
+	mapped := []netip.AddrPort{
+		netip.AddrPortFrom(netip.MustParseAddr("203.0.113.177"), mappedPort),
+		netip.AddrPortFrom(netip.MustParseAddr("203.0.113.185"), mappedPort),
+		netip.AddrPortFrom(netip.MustParseAddr("203.0.113.190"), mappedPort),
+		// A hard-NAT style singular mapping on another port stays excluded.
+		netip.AddrPortFrom(netip.MustParseAddr("203.0.113.200"), mappedPort+1),
+	}
+	var stunEndpoints []netip.AddrPort
+	for _, value := range mapped {
+		stunEndpoints = append(stunEndpoints, serveMappedSTUN(t, value))
+	}
+	c := newDirectOnlySTUNTestConn(t, stunEndpoints)
+
+	// The second report would be incremental, and probe only the fastest
+	// three regions, without direct-only's every-destination policy.
+	for round := range 2 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		endpoints, err := c.determineEndpoints(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("round %d determineEndpoints: %v", round, err)
+		}
+		var stun []netip.AddrPort
+		for _, endpoint := range endpoints {
+			if endpoint.Type == tailcfg.EndpointSTUN {
+				stun = append(stun, endpoint.Addr)
+			}
+		}
+		slices.SortFunc(stun, netip.AddrPort.Compare)
+		// The first responder is always kept; whichever destination that is,
+		// all three same-port addresses must be present. The different-port
+		// mapping may appear only if it happened to be the first responder.
+		for _, want := range mapped[:3] {
+			if !slices.Contains(stun, want) {
+				t.Fatalf("round %d STUN endpoints = %v, missing per-destination address %v", round, stun, want)
+			}
+		}
+		if len(stun) != 3 && !(len(stun) == 4 && slices.Contains(stun, mapped[3])) {
+			t.Fatalf("round %d STUN endpoints = %v, want exactly the three same-port addresses", round, stun)
+		}
+		// Endpoint caching could mask a skipped destination, so also
+		// require that this round's own report heard from every one.
+		report := c.lastNetCheckReport.Load()
+		if report == nil || len(report.RegionLatency) != len(stunEndpoints) {
+			t.Fatalf("round %d report = %+v, want answers from all %d destinations", round, report, len(stunEndpoints))
+		}
+		if got := c.DirectOnlyCounters(); got != (DirectOnlyCounters{}) {
+			t.Fatalf("round %d direct-only counters = %+v, want zero", round, got)
+		}
+	}
+}
+
+func newDirectOnlySTUNTestConn(t *testing.T, stunEndpoints []netip.AddrPort) *Conn {
+	t.Helper()
 	opts := directOnlyTestOptions(t)
-	opts.DirectSTUNEndpoint = stunEndpoint
+	opts.DirectSTUNEndpoints = stunEndpoints
 	c, err := NewConn(opts)
 	if err != nil {
 		t.Fatalf("NewConn: %v", err)
@@ -123,29 +263,44 @@ func TestDirectOnlySTUNUsesOnlyConfiguredDestinationWithoutDERP(t *testing.T) {
 		packets := [][]byte{make([]byte, 64<<10)}
 		sizes := make([]int, 1)
 		endpoints := make([]conn.Endpoint, 1)
-		_, _ = receiveFuncs[0](packets, sizes, endpoints)
+		for {
+			if _, err := receiveFuncs[0](packets, sizes, endpoints); err != nil {
+				return
+			}
+		}
 	}()
+	return c
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	report, err := c.updateNetInfo(ctx)
+// serveMappedSTUN runs a loopback STUN responder that reports mapped as the
+// requester's server-reflexive address.
+func serveMappedSTUN(t *testing.T, mapped netip.AddrPort) netip.AddrPort {
+	t.Helper()
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
-		t.Fatalf("updateNetInfo: %v", err)
+		t.Fatalf("listen STUN responder: %v", err)
 	}
-	if !report.UDP {
-		t.Fatal("configured STUN endpoint did not produce a UDP report")
-	}
-	if c.derpMap != nil || c.derpMapAtomic.Load() != nil {
-		t.Fatal("direct-only STUN installed a DERP map")
-	}
-
-	forbidden := netip.AddrPortFrom(stunEndpoint.Addr(), stunEndpoint.Port()+1)
-	if _, err := c.sendUDPNetcheck([]byte("forbidden"), forbidden); !errors.Is(err, ErrDirectOnlyEgress) {
-		t.Fatalf("sendUDPNetcheck error = %v, want %v", err, ErrDirectOnlyEgress)
-	}
-	if got := c.DirectOnlyCounters().EgressAttempts; got != 1 {
-		t.Fatalf("prohibited egress attempts = %d, want 1", got)
-	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64<<10)
+		for {
+			n, src, err := pc.ReadFromUDPAddrPort(buf)
+			if err != nil {
+				return
+			}
+			txID, err := stun.ParseBindingRequest(buf[:n])
+			if err != nil {
+				continue
+			}
+			_, _ = pc.WriteToUDPAddrPort(stun.Response(txID, mapped), src)
+		}
+	}()
+	t.Cleanup(func() {
+		pc.Close()
+		<-done
+	})
+	return netip.MustParseAddrPort(pc.LocalAddr().String())
 }
 
 func TestDirectOnlyAdvertisesLocalEndpointsWithoutSTUN(t *testing.T) {
@@ -582,7 +737,7 @@ func directOnlyTestOptions(t *testing.T) Options {
 	t.Cleanup(func() { netMon.Close() })
 	return Options{
 		DirectOnly:             true,
-		DirectSTUNEndpoint:     netip.MustParseAddrPort("127.0.0.1:3478"),
+		DirectSTUNEndpoints:    []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:3478")},
 		ForceNodeKey:           key.NewNode(),
 		ForceDiscoKey:          key.NewDisco(),
 		DisablePortMapper:      true,

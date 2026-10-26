@@ -75,7 +75,7 @@ jobs:
           go-version: "1.26.5"
           cache: true
       - name: Run focused fork tests
-        run: go test ./control/controlclient ./ipn/ipnlocal ./tsnet ./wgengine/...
+        run: go test ./control/controlclient ./ipn/ipnlocal ./net/netcheck ./tsnet ./wgengine/...
 
   race:
     runs-on: ubuntu-24.04
@@ -103,7 +103,7 @@ jobs:
           go-version: "1.26.5"
           cache: true
       - name: Run tagged Linux tests
-        run: go test -tags=waifus_direct_only ./control/controlclient ./ipn/ipnlocal ./tsnet ./wgengine/... ./cmd/waifus-direct-spike ./tstest/waifuscontrol
+        run: go test -tags=waifus_direct_only ./control/controlclient ./ipn/ipnlocal ./net/netcheck ./tsnet ./wgengine/... ./cmd/waifus-direct-spike ./tstest/waifuscontrol
       - name: Audit direct-only choke points
         run: go run ./tool/waifus-direct-audit
       - name: Install packet-matrix tools

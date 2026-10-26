@@ -35,13 +35,13 @@ func TestDirectOnlyEnginePinsNodeKeyAcrossReconfig(t *testing.T) {
 	bus := eventbustest.NewBus(t)
 	forced := key.NewNode()
 	engine, err := NewUserspaceEngine(logger.Discard, Config{
-		DirectOnly:         true,
-		DirectSTUNEndpoint: netip.MustParseAddrPort("127.0.0.1:3478"),
-		ForceNodeKey:       forced,
-		ForceDiscoKey:      key.NewDisco(),
-		HealthTracker:      health.NewTracker(bus),
-		Metrics:            new(usermetric.Registry),
-		EventBus:           bus,
+		DirectOnly:          true,
+		DirectSTUNEndpoints: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:3478")},
+		ForceNodeKey:        forced,
+		ForceDiscoKey:       key.NewDisco(),
+		HealthTracker:       health.NewTracker(bus),
+		Metrics:             new(usermetric.Registry),
+		EventBus:            bus,
 	})
 	if err != nil {
 		t.Fatalf("NewUserspaceEngine: %v", err)

@@ -68,11 +68,19 @@ and only then removes the peer. Other approved pair edges remain installed.
 An approved peer that cannot establish direct UDP before the caller's deadline
 returns `ErrWaifusDirectUnavailable`; no relay attempt follows.
 
-Public endpoint discovery uses one immutable IP-literal STUN destination. The
-fork supplies that endpoint to netcheck through a transient STUN-only descriptor;
-it is never installed as a DERP map, and send-time enforcement rejects every
-other netcheck destination. LAN gateway port mapping and validated direct peer
-candidates remain available for NAT traversal and network mobility.
+Public endpoint discovery uses a fixed list of one to eight distinct
+IP-literal STUN destinations, copied at construction. The fork supplies them to
+netcheck through a transient STUN-only descriptor with one region per
+destination; it is never installed as a DERP map, and send-time enforcement
+rejects every netcheck destination outside the list. Every refresh probes every
+listed destination (netcheck `ProbeAllRegions`) instead of only the fastest
+few, because some NATs keep the mapped port but choose the public IPv4 address
+per destination from a pool. Each observed server-reflexive address whose port
+is consistent across destinations is advertised as a direct candidate, even
+when only one destination reported it; singular observations on an
+inconsistent port stay excluded as likely hard-NAT mappings. LAN gateway port
+mapping and validated direct peer candidates remain available for NAT traversal
+and network mobility.
 
 While a direct-only instance has an authorized peer, a node key, and an online
 network, its existing randomized 20–26-second STUN refresh remains active during
@@ -101,9 +109,13 @@ The intentionally added public seams are:
   `ipnlocal.WithWaifusNetworkMapPolicy`, and
   `ipnlocal.WithWaifusLocalIdentity`, which are construction-only backend
   options.
-- `wgengine.Config.DirectOnly`, its fixed STUN/node/discovery identity fields,
-  and `magicsock.DirectOnlyCounters`, which carry and audit the structural
+- `wgengine.Config.DirectOnly`, its fixed STUN list/node/discovery identity
+  fields, `magicsock.MaxDirectSTUNEndpoints`,
+  `magicsock.ValidDirectOnlySTUNEndpoints`, and
+  `magicsock.DirectOnlyCounters`, which carry, bound, and audit the structural
   policy below tsnet.
+- `netcheck.GetReportOpts.ProbeAllRegions`, which makes every report probe
+  and wait for every region of the transient STUN-only descriptor.
 - `magicsock.Conn.RebindToNewPort`, a recovery/test hook that intentionally
   requests a fresh UDP socket tuple when no preferred port is configured and
   otherwise honors that explicit port. Callers follow it with `ReSTUN`.

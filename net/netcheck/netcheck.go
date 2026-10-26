@@ -586,6 +586,7 @@ type reportState struct {
 	start       time.Time
 	opts        *GetReportOpts
 	incremental bool // doing a lite, follow-up netcheck
+	probeAll    bool // probe and wait for every region; see GetReportOpts.ProbeAllRegions
 	stopProbeCh chan struct{}
 	waitPortMap sync.WaitGroup
 
@@ -668,7 +669,7 @@ func (rs *reportState) addNodeLatency(node *tailcfg.DERPNode, ipp netip.AddrPort
 	// incremental one. For incremental ones, wait for the
 	// duration of the slowest region. For initial ones, double
 	// that.
-	if len(ret.RegionLatency) == rs.c.enoughRegions() {
+	if !rs.probeAll && len(ret.RegionLatency) == rs.c.enoughRegions() {
 		timeout := maxDurationValue(ret.RegionLatency)
 		if !rs.incremental {
 			timeout *= 2
@@ -762,6 +763,14 @@ type GetReportOpts struct {
 	OnlyTCP443 bool
 	// OnlySTUN constrains netcheck reporting to STUN measurements over UDP.
 	OnlySTUN bool
+	// ProbeAllRegions makes every report a full probe of every measurable
+	// region and waits for each region's probe set to finish, bounded by the
+	// usual STUN probe timeout, instead of stopping once the fastest few
+	// regions have answered. Incremental reports otherwise probe only the
+	// fastest regions. It is intended for a small, fixed STUN-only map whose
+	// servers must all be observed so that every public address a NAT assigns
+	// per destination is learned.
+	ProbeAllRegions bool
 }
 
 // getLastDERPActivity calls o.GetLastDERPActivity if both o and
@@ -804,6 +813,10 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 		}
 		onlySTUN = true
 	}
+	probeAll := opts != nil && opts.ProbeAllRegions
+	if probeAll && opts.OnlyTCP443 {
+		return nil, errors.New("netcheck: ProbeAllRegions requires STUN probes but OnlyTCP443 is set in opts")
+	}
 	defer func() {
 		if reterr != nil {
 			metricNumGetReportError.Add(1)
@@ -838,6 +851,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 		report:      newReport(),
 		inFlight:    map[stun.TxID]func(netip.AddrPort){},
 		stopProbeCh: make(chan struct{}, 1),
+		probeAll:    probeAll,
 	}
 	c.curState = rs
 	last := c.last
@@ -852,7 +866,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 	}
 
 	doFull := false
-	if c.nextFull || now.Sub(c.lastFull) > fullReportInterval {
+	if c.nextFull || now.Sub(c.lastFull) > fullReportInterval || probeAll {
 		doFull = true
 	}
 	// If the last report had a captive portal and reported no UDP access,

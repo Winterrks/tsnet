@@ -300,9 +300,9 @@ type Conn struct {
 
 	// directOnly is immutable after NewConn. It can be true only in a
 	// waifus_direct_only tagged build.
-	directOnly         bool
-	directSTUNEndpoint netip.AddrPort
-	directOnlyNodeKey  key.NodePrivate
+	directOnly          bool
+	directSTUNEndpoints []netip.AddrPort // immutable copy; never mutated after NewConn
+	directOnlyNodeKey   key.NodePrivate
 
 	prohibitedDERPAttempts             atomic.Uint64
 	prohibitedPeerRelayAttempts        atomic.Uint64
@@ -485,10 +485,13 @@ type Options struct {
 	// It is accepted only in a waifus_direct_only tagged build.
 	DirectOnly bool
 
-	// DirectSTUNEndpoint is the one IP-literal STUN destination used for
-	// public endpoint discovery in DirectOnly mode. It is never installed as
-	// a DERP map and cannot be used for relay traffic.
-	DirectSTUNEndpoint netip.AddrPort
+	// DirectSTUNEndpoints is the fixed, non-empty list of distinct IP-literal
+	// STUN destinations used for public endpoint discovery in DirectOnly
+	// mode, at most MaxDirectSTUNEndpoints long. Every listed destination is
+	// probed on every netcheck so that NATs which pick a public address per
+	// destination reveal each address. The list is copied by NewConn, is
+	// never installed as a DERP map, and cannot be used for relay traffic.
+	DirectSTUNEndpoints []netip.AddrPort
 
 	// EventBus, if non-nil, is used for event publication and subscription by
 	// each Conn created from these Options. It must not be nil outside of
@@ -696,14 +699,14 @@ func NewConn(opts Options) (*Conn, error) {
 	switch {
 	case opts.DirectOnly && !directOnlyBuild:
 		return nil, ErrDirectOnlyBuildRequired
-	case opts.DirectOnly && !validDirectOnlySTUNEndpoint(opts.DirectSTUNEndpoint):
+	case opts.DirectOnly && !ValidDirectOnlySTUNEndpoints(opts.DirectSTUNEndpoints):
 		return nil, ErrDirectOnlySTUNEndpoint
 	case opts.DirectOnly && opts.ForceDiscoKey.IsZero():
 		return nil, ErrDirectOnlyDiscoKey
 	case opts.DirectOnly && opts.ForceNodeKey.IsZero():
 		return nil, ErrDirectOnlyNodeKey
-	case !opts.DirectOnly && opts.DirectSTUNEndpoint.IsValid():
-		return nil, errors.New("direct STUN endpoint requires direct-only mode")
+	case !opts.DirectOnly && len(opts.DirectSTUNEndpoints) != 0:
+		return nil, errors.New("direct STUN endpoints require direct-only mode")
 	case !opts.DirectOnly && !opts.ForceNodeKey.IsZero():
 		return nil, errors.New("forced node key requires direct-only mode")
 	case opts.NetMon == nil:
@@ -714,7 +717,7 @@ func NewConn(opts Options) (*Conn, error) {
 
 	c := newConn(opts.logf())
 	c.directOnly = opts.DirectOnly
-	c.directSTUNEndpoint = opts.DirectSTUNEndpoint
+	c.directSTUNEndpoints = slices.Clone(opts.DirectSTUNEndpoints)
 	c.directOnlyNodeKey = opts.ForceNodeKey
 	if c.directOnly {
 		c.relayManager.disable(&c.prohibitedPeerRelayAttempts)
@@ -1121,7 +1124,7 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	c.mu.Lock()
 	dm := c.derpMap
 	if c.directOnly {
-		dm = directOnlySTUNMap(c.directSTUNEndpoint)
+		dm = directOnlySTUNMap(c.directSTUNEndpoints)
 	}
 	c.mu.Unlock()
 
@@ -1140,6 +1143,7 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 		// the exact same state in two different places.
 		GetLastDERPActivity: c.health.GetDERPRegionReceivedTime,
 		OnlySTUN:            c.directOnly,
+		ProbeAllRegions:     c.directOnly,
 		OnlyTCP443:          !c.directOnly && c.onlyTCP443.Load(),
 	})
 	if err != nil {
@@ -1445,6 +1449,11 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 	for _, addr := range v6Addrs {
 		addAddr(addr, tailcfg.EndpointSTUN)
 	}
+	if c.directOnly {
+		for _, addr := range directOnlyExtraGlobalAddrs(nr) {
+			addAddr(addr, tailcfg.EndpointSTUN)
+		}
+	}
 
 	if len(v4Addrs) >= 1 {
 		// If they're behind a hard NAT and are using a fixed
@@ -1646,9 +1655,9 @@ var (
 	// direct-only network map.
 	ErrDirectOnlyRelayConfiguration = errors.New("relay configuration forbidden in direct-only mode")
 
-	// ErrDirectOnlySTUNEndpoint reports a missing or unsafe immutable STUN
-	// destination in direct-only mode.
-	ErrDirectOnlySTUNEndpoint = errors.New("valid direct-only STUN endpoint is required")
+	// ErrDirectOnlySTUNEndpoint reports a missing, oversized, duplicated, or
+	// unsafe immutable STUN destination list in direct-only mode.
+	ErrDirectOnlySTUNEndpoint = errors.New("valid direct-only STUN endpoint list is required")
 
 	// ErrDirectOnlyDiscoKey reports a missing helper-owned immutable discovery
 	// key in direct-only mode.
@@ -1659,11 +1668,16 @@ var (
 	ErrDirectOnlyNodeKey = errors.New("direct-only node key is required and immutable")
 
 	// ErrDirectOnlyEgress reports an attempted direct-only network-check probe
-	// outside the immutable STUN destination.
+	// outside the immutable STUN destination list.
 	ErrDirectOnlyEgress = errors.New("network destination forbidden in direct-only mode")
 
 	errConnClosed = errors.New("Conn closed")
 )
+
+// MaxDirectSTUNEndpoints bounds the direct-only STUN destination list. Each
+// destination is probed on every netcheck, so the bound also bounds the STUN
+// packets sent per refresh.
+const MaxDirectSTUNEndpoints = 8
 
 func validDirectOnlySTUNEndpoint(endpoint netip.AddrPort) bool {
 	address := endpoint.Addr()
@@ -1672,33 +1686,87 @@ func validDirectOnlySTUNEndpoint(endpoint netip.AddrPort) bool {
 		address != tailcfg.DerpMagicIPAddr && !tsaddr.IsTailscaleIP(address)
 }
 
-func directOnlySTUNMap(endpoint netip.AddrPort) *tailcfg.DERPMap {
-	ipv4, ipv6 := "none", "none"
-	if endpoint.Addr().Is4() {
-		ipv4 = endpoint.Addr().String()
-	} else {
-		ipv6 = endpoint.Addr().String()
+// ValidDirectOnlySTUNEndpoints reports whether endpoints is an acceptable
+// direct-only STUN destination list: between one and MaxDirectSTUNEndpoints
+// distinct, individually valid IP-literal destinations.
+func ValidDirectOnlySTUNEndpoints(endpoints []netip.AddrPort) bool {
+	if len(endpoints) == 0 || len(endpoints) > MaxDirectSTUNEndpoints {
+		return false
 	}
-	const regionID = 1
+	for index, endpoint := range endpoints {
+		if !validDirectOnlySTUNEndpoint(endpoint) || slices.Contains(endpoints[:index], endpoint) {
+			return false
+		}
+	}
+	return true
+}
+
+// directOnlySTUNEndpointAllowed reports whether addr is one of the immutable
+// direct-only STUN destinations.
+func (c *Conn) directOnlySTUNEndpointAllowed(addr netip.AddrPort) bool {
+	return slices.Contains(c.directSTUNEndpoints, addr)
+}
+
+// directOnlySTUNMap returns a transient STUN-only descriptor for netcheck.
+// Each destination gets its own region so netcheck measures, and learns the
+// server-reflexive address from, every destination independently.
+func directOnlySTUNMap(endpoints []netip.AddrPort) *tailcfg.DERPMap {
+	regions := make(map[int]*tailcfg.DERPRegion, len(endpoints))
+	for index, endpoint := range endpoints {
+		ipv4, ipv6 := "none", "none"
+		if endpoint.Addr().Is4() {
+			ipv4 = endpoint.Addr().String()
+		} else {
+			ipv6 = endpoint.Addr().String()
+		}
+		regionID := index + 1
+		name := fmt.Sprintf("waifus-stun-%d", regionID)
+		regions[regionID] = &tailcfg.DERPRegion{
+			RegionID:   regionID,
+			RegionCode: name,
+			RegionName: fmt.Sprintf("Waifus STUN %d", regionID),
+			Nodes: []*tailcfg.DERPNode{{
+				Name:     name,
+				RegionID: regionID,
+				HostName: name + tailcfg.DotInvalid,
+				IPv4:     ipv4,
+				IPv6:     ipv6,
+				STUNPort: int(endpoint.Port()),
+				STUNOnly: true,
+			}},
+		}
+	}
 	return &tailcfg.DERPMap{
 		OmitDefaultRegions: true,
-		Regions: map[int]*tailcfg.DERPRegion{
-			regionID: {
-				RegionID:   regionID,
-				RegionCode: "waifus-stun",
-				RegionName: "Waifus STUN",
-				Nodes: []*tailcfg.DERPNode{{
-					Name:     "waifus-stun",
-					RegionID: regionID,
-					HostName: "waifus-stun" + tailcfg.DotInvalid,
-					IPv4:     ipv4,
-					IPv6:     ipv6,
-					STUNPort: int(endpoint.Port()),
-					STUNOnly: true,
-				}},
-			},
-		},
+		Regions:            regions,
 	}
+}
+
+// directOnlyExtraGlobalAddrs returns observed server-reflexive addresses that
+// [netcheck.Report.GetGlobalAddrs] omits because only one destination
+// reported them, but whose mapped port was reported by at least two
+// destinations in the same family. Such NATs keep a consistent mapped port and
+// choose the public address per destination, so each address is a real
+// candidate for some peer path. A singular observation whose port no other
+// destination saw remains excluded, as it is likely a per-destination
+// hard-NAT mapping. The result is sorted.
+func directOnlyExtraGlobalAddrs(nr *netcheck.Report) []netip.AddrPort {
+	var extra []netip.AddrPort
+	add := func(preferred netip.AddrPort, counters map[netip.AddrPort]int) {
+		portObservations := make(map[uint16]int, len(counters))
+		for addr, count := range counters {
+			portObservations[addr.Port()] += count
+		}
+		for addr, count := range counters {
+			if count == 1 && addr != preferred && portObservations[addr.Port()] >= 2 {
+				extra = append(extra, addr)
+			}
+		}
+	}
+	add(nr.GlobalV4, nr.GlobalV4Counters)
+	add(nr.GlobalV6, nr.GlobalV6Counters)
+	slices.SortFunc(extra, netip.AddrPort.Compare)
+	return extra
 }
 
 var errDropDerpPacket = errors.New("too many DERP packets queued; dropping")
@@ -1802,7 +1870,7 @@ func (c *Conn) maybeRebindOnError(err error) {
 // returns errors.ErrUnsupported if the client is explicitly configured to only
 // send data over TCP port 443 and/or we're running on wasm.
 func (c *Conn) sendUDPNetcheck(b []byte, addr netip.AddrPort) (int, error) {
-	if c.directOnly && addr != c.directSTUNEndpoint {
+	if c.directOnly && !c.directOnlySTUNEndpointAllowed(addr) {
 		c.prohibitedEgressAttempts.Add(1)
 		return 0, ErrDirectOnlyEgress
 	}

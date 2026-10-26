@@ -92,7 +92,7 @@ func auditRepository(root string) []error {
 		{
 			file:   "wgengine/magicsock/magicsock.go",
 			name:   "NewConn",
-			before: "validDirectOnlySTUNEndpoint(opts.DirectSTUNEndpoint)",
+			before: "ValidDirectOnlySTUNEndpoints(opts.DirectSTUNEndpoints)",
 			after:  "newConn",
 		},
 		{
@@ -122,13 +122,13 @@ func auditRepository(root string) []error {
 		{
 			file:   "wgengine/magicsock/magicsock.go",
 			name:   "updateNetInfo",
-			before: "directOnlySTUNMap(c.directSTUNEndpoint)",
+			before: "directOnlySTUNMap(c.directSTUNEndpoints)",
 			after:  "c.netChecker.GetReport",
 		},
 		{
 			file:   "wgengine/magicsock/magicsock.go",
 			name:   "sendUDPNetcheck",
-			before: "addr != c.directSTUNEndpoint",
+			before: "c.directOnly && !c.directOnlySTUNEndpointAllowed(addr)",
 			after:  "c.pconn4.WriteToUDPAddrPort",
 		},
 		{
@@ -194,20 +194,20 @@ func auditRepository(root string) []error {
 		{
 			file:   "tsnet/tsnet.go",
 			name:   "start",
-			before: "DirectOnly:         s.waifusControl != nil",
-			after:  "Tun:                s.Tun",
+			before: "DirectOnly:          s.waifusControl != nil",
+			after:  "Tun:                 s.Tun",
 		},
 		{
 			file:   "tsnet/tsnet.go",
 			name:   "start",
-			before: "ForceNodeKey:       forceNodeKey",
-			after:  "ForceDiscoKey:      forceDiscoKey",
+			before: "ForceNodeKey:        forceNodeKey",
+			after:  "ForceDiscoKey:       forceDiscoKey",
 		},
 		{
 			file:   "tsnet/tsnet.go",
 			name:   "start",
-			before: "ForceDiscoKey:      forceDiscoKey",
-			after:  "Tun:                s.Tun",
+			before: "ForceDiscoKey:       forceDiscoKey",
+			after:  "Tun:                 s.Tun",
 		},
 		{
 			file:   "tsnet/tsnet.go",

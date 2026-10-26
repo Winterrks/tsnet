@@ -20,6 +20,7 @@ import (
 
 	"tailscale.com/derp"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/stun"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest/nettest"
@@ -1100,4 +1101,81 @@ func TestNoUDPNilGetReportOpts(t *testing.T) {
 	if r.UDP {
 		t.Fatal("unexpected working UDP")
 	}
+}
+
+func TestProbeAllRegions(t *testing.T) {
+	var stunAddrs []string
+	for range 4 {
+		addr, cleanup := stuntest.Serve(t)
+		t.Cleanup(cleanup)
+		stunAddrs = append(stunAddrs, addr.String())
+	}
+	// A slower destination is cut off by the default "enough regions" early
+	// stop, and is never in an incremental report's fastest-regions plan.
+	stunAddrs = append(stunAddrs, serveDelayedSTUN(t, 300*time.Millisecond))
+	dm := stuntest.DERPMapOf(stunAddrs...)
+
+	for _, probeAll := range []bool{false, true} {
+		t.Run(fmt.Sprintf("probeAll=%v", probeAll), func(t *testing.T) {
+			c := newTestClient(t)
+			if err := c.Standalone(t.Context(), "127.0.0.1:0"); err != nil {
+				t.Fatal(err)
+			}
+			opts := &GetReportOpts{OnlySTUN: true, ProbeAllRegions: probeAll}
+			for round := range 2 {
+				r, err := c.GetReport(t.Context(), dm, opts)
+				if err != nil {
+					t.Fatalf("round %d: %v", round, err)
+				}
+				got := len(r.RegionLatency)
+				switch {
+				case probeAll && got != len(stunAddrs):
+					t.Fatalf("round %d answered regions = %v, want all %d", round, r.RegionLatency, len(stunAddrs))
+				case !probeAll && round == 1 && got >= len(stunAddrs):
+					t.Fatalf("incremental default report answered all regions %v; test no longer distinguishes ProbeAllRegions", r.RegionLatency)
+				}
+			}
+		})
+	}
+}
+
+func TestProbeAllRegionsRejectsOnlyTCP443(t *testing.T) {
+	c := newTestClient(t)
+	_, err := c.GetReport(t.Context(), stuntest.DERPMapOf("127.0.0.1:3478"), &GetReportOpts{OnlyTCP443: true, ProbeAllRegions: true})
+	if err == nil {
+		t.Fatal("GetReport accepted ProbeAllRegions with OnlyTCP443")
+	}
+}
+
+// serveDelayedSTUN runs a loopback STUN responder that answers each binding
+// request after delay.
+func serveDelayedSTUN(t *testing.T, delay time.Duration) string {
+	t.Helper()
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64<<10)
+		for {
+			n, src, err := pc.ReadFromUDPAddrPort(buf)
+			if err != nil {
+				return
+			}
+			txID, err := stun.ParseBindingRequest(buf[:n])
+			if err != nil {
+				continue
+			}
+			time.AfterFunc(delay, func() {
+				_, _ = pc.WriteToUDPAddrPort(stun.Response(txID, src), src)
+			})
+		}
+	}()
+	t.Cleanup(func() {
+		pc.Close()
+		<-done
+	})
+	return pc.LocalAddr().String()
 }
