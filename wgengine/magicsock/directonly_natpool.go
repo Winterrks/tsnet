@@ -6,6 +6,8 @@ package magicsock
 import (
 	"bytes"
 	"context"
+	"errors"
+	"net"
 	"net/netip"
 	"slices"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"tailscale.com/net/netcheck"
+	"tailscale.com/net/sockopts"
 	"tailscale.com/net/stun"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/nettype"
@@ -53,6 +56,32 @@ const (
 	directOnlyPoolRoundInterval = time.Minute
 )
 
+// directOnlyNATPoolTracked bounds every address the pool tracks, admitted or
+// not, so that a destination reporting a new address on every refresh cannot
+// grow it; unadmitted addresses are evicted first.
+const directOnlyNATPoolTracked = 2 * directOnlyNATPoolMax
+
+// directOnlyNATPoolPairs bounds the recorded cross-address port evidence.
+const directOnlyNATPoolPairs = 2 * directOnlyNATPoolMax
+
+// directOnlyPoolObservation is one binding response: the fixed STUN
+// destination that answered and the mapping it reported.
+type directOnlyPoolObservation struct {
+	destination netip.AddrPort
+	mapped      netip.AddrPort
+}
+
+// directOnlyPoolEntry is one tracked public address.
+type directOnlyPoolEntry struct {
+	lastSeen time.Time
+	// reporters are the distinct STUN destinations that reported the
+	// address on this network. It is admitted once two have, so that a
+	// single lying or spoofed destination cannot add an address.
+	reporters map[netip.AddrPort]struct{}
+}
+
+func (e *directOnlyPoolEntry) admitted() bool { return len(e.reporters) >= 2 }
+
 // directOnlyNATPool is the per-network memory of observed public IPv4
 // addresses. Its zero value is ready to use and needs a learning round.
 type directOnlyNATPool struct {
@@ -63,23 +92,54 @@ type directOnlyNATPool struct {
 	// generation changes whenever the pool is cleared, so observations
 	// from a round that straddled a reset are discarded.
 	generation uint64
-	// seen maps each remembered public address to when it was last observed.
-	seen map[netip.Addr]time.Time
+	// entries are the tracked public addresses.
+	entries map[netip.Addr]*directOnlyPoolEntry
 	// learned reports that a learning round on this link got an answer.
 	learned bool
 	// lastRound is when the latest learning round on this link started.
 	lastRound time.Time
-	// crossAddressPort reports that one socket on this link observed two
-	// pool addresses with the same mapped port: the NAT keeps a socket's
-	// port across the addresses it chooses.
-	crossAddressPort bool
+	// pairs records, with when it was last seen, each pair of distinct
+	// addresses that one socket observed with the same mapped port. A pair
+	// of admitted addresses shows that the NAT keeps a socket's port across
+	// the addresses it chooses.
+	pairs map[[2]netip.Addr]time.Time
+}
+
+// directOnlyReservedIPv4 lists IPv4 ranges that are never a NAT's public
+// address: this-network, private, shared address space, loopback,
+// link-local, IETF protocol assignments, documentation, the 6to4 relay
+// anycast, benchmarking, multicast, and reserved (with broadcast).
+var directOnlyReservedIPv4 = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
 }
 
 // directOnlyNATPoolAddress reports whether addr may be remembered as a NAT
-// public address: a global unicast, non-private IPv4 outside the Tailscale
-// ranges.
+// public address: an IPv4 address outside every reserved or special-purpose
+// range and outside the Tailscale ranges.
 func directOnlyNATPoolAddress(addr netip.Addr) bool {
-	return addr.Is4() && addr.IsGlobalUnicast() && !addr.IsPrivate() && !tsaddr.IsTailscaleIP(addr)
+	if !addr.Is4() || tsaddr.IsTailscaleIP(addr) {
+		return false
+	}
+	for _, prefix := range directOnlyReservedIPv4 {
+		if prefix.Contains(addr) {
+			return false
+		}
+	}
+	return true
 }
 
 // resetLocked forgets everything learned and records link as the current
@@ -87,10 +147,10 @@ func directOnlyNATPoolAddress(addr netip.Addr) bool {
 func (p *directOnlyNATPool) resetLocked(link string) {
 	p.link = link
 	p.generation++
-	p.seen = nil
+	p.entries = nil
 	p.learned = false
 	p.lastRound = time.Time{}
-	p.crossAddressPort = false
+	p.pairs = nil
 }
 
 // reset forgets the pool, for example after a rebind or network loss.
@@ -100,22 +160,28 @@ func (p *directOnlyNATPool) reset() {
 	p.resetLocked(p.link)
 }
 
-// expireLocked drops addresses not observed within the lifetime.
+// expireLocked drops addresses and evidence not observed within the
+// lifetime.
 func (p *directOnlyNATPool) expireLocked(now time.Time) {
-	for addr, at := range p.seen {
+	for addr, entry := range p.entries {
+		if now.Sub(entry.lastSeen) > directOnlyNATPoolLifetime {
+			delete(p.entries, addr)
+		}
+	}
+	for pair, at := range p.pairs {
 		if now.Sub(at) > directOnlyNATPoolLifetime {
-			delete(p.seen, addr)
+			delete(p.pairs, pair)
 		}
 	}
 }
 
 // beginRefresh switches the pool to link, clearing it if the network
 // changed, and returns the generation that this refresh's observations
-// belong to. It also reports whether this refresh should run a learning
-// round: on a new network, until a round has been answered, and whenever a
-// remembered address has gone unobserved for the relearn age, but at most
-// once per round interval.
-func (p *directOnlyNATPool) beginRefresh(now time.Time, link string) (generation uint64, learn bool) {
+// belong to and every address tracked before it. It also reports whether
+// this refresh should run a learning round: on a new network, until a round
+// has been answered, and whenever an admitted address has gone unobserved
+// for the relearn age, but at most once per round interval.
+func (p *directOnlyNATPool) beginRefresh(now time.Time, link string) (generation uint64, learn bool, remembered []netip.Addr) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if link != p.link || p.generation == 0 {
@@ -123,52 +189,155 @@ func (p *directOnlyNATPool) beginRefresh(now time.Time, link string) (generation
 	}
 	p.expireLocked(now)
 	due := !p.learned
-	for _, at := range p.seen {
-		due = due || now.Sub(at) >= directOnlyNATPoolRelearnAge
+	for addr, entry := range p.entries {
+		remembered = append(remembered, addr)
+		due = due || entry.admitted() && now.Sub(entry.lastSeen) >= directOnlyNATPoolRelearnAge
 	}
+	slices.SortFunc(remembered, netip.Addr.Compare)
 	if !due || !p.lastRound.IsZero() && now.Sub(p.lastRound) < directOnlyPoolRoundInterval {
-		return p.generation, false
+		return p.generation, false, remembered
 	}
 	p.lastRound = now
+	return p.generation, true, remembered
+}
+
+// resetIfUnrelated clears the pool when the main socket's report, from the
+// refresh of generation, shares no address with the addresses remembered
+// before that refresh: the network changed without a rebind or a new link
+// fingerprint (for example the same interface and local address behind
+// another NAT). It returns the generation the report belongs to afterwards
+// and whether it reset.
+func (p *directOnlyNATPool) resetIfUnrelated(generation uint64, main []directOnlyPoolObservation, remembered []netip.Addr) (uint64, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if generation != p.generation || len(remembered) == 0 {
+		return p.generation, false
+	}
+	related, observed := false, false
+	for _, observation := range main {
+		addr := observation.mapped.Addr().Unmap()
+		if !directOnlyNATPoolAddress(addr) {
+			continue
+		}
+		observed = true
+		related = related || slices.Contains(remembered, addr)
+	}
+	if !observed || related {
+		return p.generation, false
+	}
+	p.resetLocked(p.link)
 	return p.generation, true
 }
 
-// observe records the mapped addresses one socket saw, and whether the
-// observations show the NAT keeping the socket's port across pool addresses.
-// Observations from an earlier generation are ignored.
-func (p *directOnlyNATPool) observe(now time.Time, generation uint64, mapped []netip.AddrPort) {
+// observe records the responses one socket received, and whether they show
+// the NAT keeping the socket's port across pool addresses. Observations from
+// an earlier generation are ignored.
+func (p *directOnlyNATPool) observe(now time.Time, generation uint64, observations []directOnlyPoolObservation) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if generation != p.generation {
 		return
 	}
-	addrsByPort := make(map[uint16]netip.Addr)
-	for _, ap := range mapped {
-		addr := ap.Addr().Unmap()
-		if !directOnlyNATPoolAddress(addr) {
+	addrsByPort := make(map[uint16][]netip.Addr)
+	for _, observation := range observations {
+		addr := observation.mapped.Addr().Unmap()
+		if !directOnlyNATPoolAddress(addr) || !observation.destination.IsValid() {
 			continue
 		}
-		if first, ok := addrsByPort[ap.Port()]; !ok {
-			addrsByPort[ap.Port()] = addr
-		} else if first != addr {
-			p.crossAddressPort = true
+		port := observation.mapped.Port()
+		if !slices.Contains(addrsByPort[port], addr) {
+			addrsByPort[port] = append(addrsByPort[port], addr)
 		}
-		if p.seen == nil {
-			p.seen = make(map[netip.Addr]time.Time)
+		if p.entries == nil {
+			p.entries = make(map[netip.Addr]*directOnlyPoolEntry)
 		}
-		p.seen[addr] = now
+		entry := p.entries[addr]
+		if entry == nil {
+			entry = &directOnlyPoolEntry{reporters: make(map[netip.AddrPort]struct{})}
+			p.entries[addr] = entry
+		}
+		entry.lastSeen = now
+		if len(entry.reporters) < MaxDirectSTUNEndpoints {
+			entry.reporters[observation.destination] = struct{}{}
+		}
 	}
-	p.expireLocked(now)
-	for len(p.seen) > directOnlyNATPoolMax {
-		var oldest netip.Addr
-		var oldestAt time.Time
-		for addr, at := range p.seen {
-			if !oldest.IsValid() || at.Before(oldestAt) || at.Equal(oldestAt) && addr.Less(oldest) {
-				oldest, oldestAt = addr, at
+	for _, addrs := range addrsByPort {
+		for i := range addrs {
+			for j := i + 1; j < len(addrs); j++ {
+				pair := [2]netip.Addr{addrs[i], addrs[j]}
+				if pair[1].Less(pair[0]) {
+					pair[0], pair[1] = pair[1], pair[0]
+				}
+				if p.pairs == nil {
+					p.pairs = make(map[[2]netip.Addr]time.Time)
+				}
+				p.pairs[pair] = now
 			}
 		}
-		delete(p.seen, oldest)
 	}
+	p.expireLocked(now)
+	p.boundLocked()
+}
+
+// boundLocked evicts the least recently seen addresses beyond the bounds:
+// unadmitted ones first, then admitted ones beyond directOnlyNATPoolMax; and
+// the least recently seen evidence pairs, those not between two admitted
+// addresses first.
+func (p *directOnlyNATPool) boundLocked() {
+	evict := func(admitted bool) bool {
+		var oldest netip.Addr
+		var oldestAt time.Time
+		for addr, entry := range p.entries {
+			if entry.admitted() != admitted {
+				continue
+			}
+			if !oldest.IsValid() || entry.lastSeen.Before(oldestAt) || entry.lastSeen.Equal(oldestAt) && addr.Less(oldest) {
+				oldest, oldestAt = addr, entry.lastSeen
+			}
+		}
+		if !oldest.IsValid() {
+			return false
+		}
+		delete(p.entries, oldest)
+		return true
+	}
+	for len(p.entries) > directOnlyNATPoolTracked {
+		if !evict(false) {
+			evict(true)
+		}
+	}
+	for p.admittedCountLocked() > directOnlyNATPoolMax {
+		evict(true)
+	}
+	for len(p.pairs) > directOnlyNATPoolPairs {
+		var oldest [2]netip.Addr
+		var oldestAt time.Time
+		found, oldestReal := false, true
+		for pair, at := range p.pairs {
+			real := p.admittedLocked(pair[0]) && p.admittedLocked(pair[1])
+			better := !found || oldestReal && !real ||
+				oldestReal == real && (at.Before(oldestAt) || at.Equal(oldestAt) && (pair[0].Less(oldest[0]) || pair[0] == oldest[0] && pair[1].Less(oldest[1])))
+			if better {
+				oldest, oldestAt, oldestReal, found = pair, at, real, true
+			}
+		}
+		delete(p.pairs, oldest)
+	}
+}
+
+func (p *directOnlyNATPool) admittedLocked(addr netip.Addr) bool {
+	entry := p.entries[addr]
+	return entry != nil && entry.admitted()
+}
+
+func (p *directOnlyNATPool) admittedCountLocked() int {
+	count := 0
+	for _, entry := range p.entries {
+		if entry.admitted() {
+			count++
+		}
+	}
+	return count
 }
 
 // markLearned records that a learning round of generation got an answer.
@@ -180,43 +349,48 @@ func (p *directOnlyNATPool) markLearned(generation uint64) {
 	}
 }
 
-// snapshot returns the remembered addresses, sorted, and whether the NAT was
-// seen keeping a port across pool addresses on this network.
+// snapshot returns the admitted addresses, sorted, and whether one socket on
+// this network saw two admitted addresses with the same mapped port.
 func (p *directOnlyNATPool) snapshot(now time.Time) (addrs []netip.Addr, crossAddressPort bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.expireLocked(now)
-	for addr := range p.seen {
-		addrs = append(addrs, addr)
+	for addr, entry := range p.entries {
+		if entry.admitted() {
+			addrs = append(addrs, addr)
+		}
 	}
 	slices.SortFunc(addrs, netip.Addr.Compare)
-	return addrs, p.crossAddressPort
+	for pair := range p.pairs {
+		crossAddressPort = crossAddressPort || p.admittedLocked(pair[0]) && p.admittedLocked(pair[1])
+	}
+	return addrs, crossAddressPort
 }
 
-// directOnlyPoolPort returns the mapped port to pair with every remembered
+// directOnlyPoolPort returns the mapped port to pair with every admitted
 // pool address, given the main socket's report and local port. Every IPv4
-// observation of the main socket must share one mapped port, and either that
-// port is the local port (a port-preserving NAT) or some socket on this
-// network saw two pool addresses with one port (the NAT keeps the port across
-// the addresses it chooses). Otherwise the port another pool address would
-// carry is unknown and no pool candidate is derived.
-func directOnlyPoolPort(nr *netcheck.Report, localPort uint16, crossAddressPort bool) (uint16, bool) {
-	if nr == nil || len(nr.GlobalV4Counters) == 0 {
+// observation of the main socket for an admitted address must share one
+// mapped port (observations only one destination vouched for are ignored),
+// and either that port is the local port (a port-preserving NAT) or some
+// socket on this network saw two admitted addresses with one port (the NAT
+// keeps the port across the addresses it chooses). Otherwise the port
+// another pool address would carry is unknown and no pool candidate is
+// derived.
+func directOnlyPoolPort(nr *netcheck.Report, localPort uint16, crossAddressPort bool, admitted []netip.Addr) (uint16, bool) {
+	if nr == nil {
 		return 0, false
 	}
 	var port uint16
-	addrs := make(map[netip.Addr]bool, len(nr.GlobalV4Counters))
 	for ap := range nr.GlobalV4Counters {
+		if !slices.Contains(admitted, ap.Addr().Unmap()) {
+			continue
+		}
 		if port != 0 && ap.Port() != port {
 			return 0, false
 		}
 		port = ap.Port()
-		addrs[ap.Addr()] = true
 	}
-	if port == 0 {
-		return 0, false
-	}
-	if port == localPort || crossAddressPort || len(addrs) >= 2 {
+	if port != 0 && (port == localPort || crossAddressPort) {
 		return port, true
 	}
 	return 0, false
@@ -257,7 +431,7 @@ func (c *Conn) directOnlyPoolEndpoints(nr *netcheck.Report) []netip.AddrPort {
 		return nil
 	}
 	addrs, crossAddressPort := c.directOnlyNATPool.snapshot(time.Now())
-	port, ok := directOnlyPoolPort(nr, c.LocalPort(), crossAddressPort)
+	port, ok := directOnlyPoolPort(nr, c.LocalPort(), crossAddressPort, addrs)
 	if !ok {
 		return nil
 	}
@@ -304,24 +478,33 @@ func (c *Conn) probeDirectOnlyNATPool(ctx context.Context, generation uint64) bo
 	answered := make([]bool, directOnlyPoolProbeSockets)
 	for index := range directOnlyPoolProbeSockets {
 		wg.Go(func() {
-			mapped := c.probeDirectOnlyPoolSocket(ctx, destinations)
-			c.directOnlyNATPool.observe(time.Now(), generation, mapped)
-			answered[index] = len(mapped) != 0
+			observations := c.probeDirectOnlyPoolSocket(ctx, destinations)
+			c.directOnlyNATPool.observe(time.Now(), generation, observations)
+			answered[index] = len(observations) != 0
 		})
 	}
 	wg.Wait()
 	return slices.Contains(answered, true)
 }
 
+// directOnlyPoolProbeReadErrors bounds consecutive non-closing read errors
+// a learning socket tolerates, such as a Windows WSAECONNRESET left by an
+// ICMP port unreachable.
+const directOnlyPoolProbeReadErrors = 8
+
 // probeDirectOnlyPoolSocket opens one extra UDP socket, sends a binding
 // request to each destination (retransmitting unanswered ones at most twice),
-// and returns the mapped addresses from responses that match a request's
-// transaction ID and destination. The socket is closed before it returns.
-func (c *Conn) probeDirectOnlyPoolSocket(ctx context.Context, destinations []netip.AddrPort) []netip.AddrPort {
+// and returns the responses that match a request's transaction ID and
+// destination, in destination order. The socket is closed before it returns.
+func (c *Conn) probeDirectOnlyPoolSocket(ctx context.Context, destinations []netip.AddrPort) []directOnlyPoolObservation {
 	pc, err := c.listenPacket("udp4", 0)
 	if err != nil {
 		c.dlogf("[v1] magicsock: direct-only NAT pool probe socket: %v", err)
 		return nil
+	}
+	// As for the main sockets: an ICMP error must not fail later reads.
+	if err := sockopts.SetICMPErrImmunity(pc); err != nil {
+		c.dlogf("[v1] magicsock: direct-only NAT pool probe socket: %v", err)
 	}
 	type datagram struct {
 		payload []byte
@@ -340,11 +523,21 @@ func (c *Conn) probeDirectOnlyPoolSocket(ctx context.Context, destinations []net
 	go func() {
 		defer close(readerDone)
 		buffer := make([]byte, 1500)
-		for {
+		for failures := 0; ; {
 			n, source, err := pc.ReadFromUDPAddrPort(buffer)
 			if err != nil {
-				return
+				failures++
+				select {
+				case <-done:
+					return
+				default:
+				}
+				if errors.Is(err, net.ErrClosed) || failures >= directOnlyPoolProbeReadErrors {
+					return
+				}
+				continue
 			}
+			failures = 0
 			select {
 			case received <- datagram{payload: bytes.Clone(buffer[:n]), source: source}:
 			case <-done:
@@ -399,14 +592,26 @@ func (c *Conn) probeDirectOnlyPoolSocket(ctx context.Context, destinations []net
 	return directOnlyPoolAnswers(destinations, answers)
 }
 
-// directOnlyPoolAnswers returns the answered mapped addresses in destination
-// order.
-func directOnlyPoolAnswers(destinations []netip.AddrPort, answers map[netip.AddrPort]netip.AddrPort) []netip.AddrPort {
-	mapped := make([]netip.AddrPort, 0, len(answers))
+// directOnlyPoolAnswers returns the answers in destination order.
+func directOnlyPoolAnswers(destinations []netip.AddrPort, answers map[netip.AddrPort]netip.AddrPort) []directOnlyPoolObservation {
+	observations := make([]directOnlyPoolObservation, 0, len(answers))
 	for _, destination := range destinations {
-		if ap, ok := answers[destination]; ok {
-			mapped = append(mapped, ap)
+		if mapped, ok := answers[destination]; ok {
+			observations = append(observations, directOnlyPoolObservation{destination: destination, mapped: mapped})
 		}
 	}
-	return mapped
+	return observations
+}
+
+// directOnlyMainObservations returns the main socket's per-destination IPv4
+// observations from a report of the transient STUN-only descriptor, whose
+// region i is direct-only STUN destination i-1.
+func (c *Conn) directOnlyMainObservations(report *netcheck.Report) []directOnlyPoolObservation {
+	var observations []directOnlyPoolObservation
+	for index, destination := range c.directSTUNEndpoints {
+		if mapped, ok := report.GlobalV4ByRegion[index+1]; ok {
+			observations = append(observations, directOnlyPoolObservation{destination: destination, mapped: mapped})
+		}
+	}
+	return observations
 }

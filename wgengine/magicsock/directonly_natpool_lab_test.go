@@ -6,12 +6,15 @@
 package magicsock
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,6 +22,7 @@ import (
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest/natlab"
+	"tailscale.com/types/nettype"
 )
 
 // directOnlyPoolNAT is a natlab NAT that keeps each socket's local port and
@@ -130,11 +134,62 @@ func (n *directOnlyPoolNAT) mainSocketChoice(dst netip.AddrPort) netip.Addr {
 
 const directOnlyPoolLabRemotePort = 41641
 
+// forgingSTUN is a lying STUN server: it answers every binding request with
+// a new forged public address on the requester's real mapped port.
+type forgingSTUN struct {
+	mu     sync.Mutex
+	forged []netip.AddrPort
+}
+
+func (f *forgingSTUN) serve(t *testing.T, machine *natlab.Machine, iface *natlab.Interface) netip.AddrPort {
+	t.Helper()
+	pc, err := machine.ListenPacket(context.Background(), "udp4", ":3478")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	conn := pc.(nettype.PacketConn)
+	go func() {
+		buffer := make([]byte, 1500)
+		for {
+			n, source, err := conn.ReadFromUDPAddrPort(buffer)
+			if err != nil {
+				return
+			}
+			txID, err := stun.ParseBindingRequest(buffer[:n])
+			if err != nil {
+				continue
+			}
+			f.mu.Lock()
+			index := len(f.forged)
+			// A low address, so that sorting by address would rank it
+			// before the real ones.
+			forged := netip.AddrPortFrom(netip.AddrFrom4([4]byte{1, 0, 1 + byte(index>>8), byte(index)}), source.Port())
+			f.forged = append(f.forged, forged)
+			f.mu.Unlock()
+			conn.WriteToUDPAddrPort(stun.Response(txID, forged), source)
+		}
+	}()
+	return netip.AddrPortFrom(iface.V4(), 3478)
+}
+
+func (f *forgingSTUN) isForged(addr netip.Addr) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, forged := range f.forged {
+		if forged.Addr() == addr {
+			return true
+		}
+	}
+	return false
+}
+
 // newDirectOnlyPoolLab builds two STUN servers and two sites: a host behind
 // a single-address port-preserving NAT, and a remote behind a two-address
 // pool NAT whose main-socket choices are bits of seed: bit i for STUN
-// destination i, the next bit for every other destination (the host).
-func newDirectOnlyPoolLab(t *testing.T, seed int) (*directOnlyNATLab, *directOnlyPoolNAT) {
+// destination i, the next bit for every other destination (the host). With
+// a liar, a third, lying STUN server is listed too.
+func newDirectOnlyPoolLab(t *testing.T, seed int, liar ...*forgingSTUN) (*directOnlyNATLab, *directOnlyPoolNAT) {
 	t.Helper()
 	inet := natlab.NewInternet()
 	lab := &directOnlyNATLab{t: t, start: time.Now()}
@@ -148,6 +203,11 @@ func newDirectOnlyPoolLab(t *testing.T, seed int) (*directOnlyNATLab, *directOnl
 		udp, cleanup := stuntest.ServeWithPacketListener(t, machine)
 		t.Cleanup(cleanup)
 		lab.stunAddrs = append(lab.stunAddrs, netip.AddrPortFrom(iface.V4(), uint16(udp.Port)))
+	}
+	for _, forging := range liar {
+		machine := &natlab.Machine{Name: "stun-liar"}
+		iface := machine.Attach("eth0", inet)
+		lab.stunAddrs = append(lab.stunAddrs, forging.serve(t, machine, iface))
 	}
 	site := func(name, prefix string, nat *directOnlyPoolNAT, poolSize int) *natlab.Machine {
 		natMachine := &natlab.Machine{Name: name + "-nat"}
@@ -383,8 +443,8 @@ func TestDirectOnlyRebindClearsNATPool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	generation, _ := c.directOnlyNATPool.beginRefresh(time.Now(), c.directOnlyLinkFingerprint())
-	c.directOnlyNATPool.observe(time.Now(), generation, []netip.AddrPort{netip.MustParseAddrPort("203.0.113.1:41641")})
+	generation, _, _ := c.directOnlyNATPool.beginRefresh(time.Now(), c.directOnlyLinkFingerprint())
+	c.directOnlyNATPool.observe(time.Now(), generation, poolObs(1, "45.0.0.1:41641", 2, "45.0.0.1:41641"))
 	c.directOnlyNATPool.markLearned(generation)
 	if addrs, _ := c.directOnlyNATPool.snapshot(time.Now()); len(addrs) != 1 {
 		t.Fatalf("pool = %v", addrs)
@@ -393,7 +453,135 @@ func TestDirectOnlyRebindClearsNATPool(t *testing.T) {
 	if addrs, _ := c.directOnlyNATPool.snapshot(time.Now()); len(addrs) != 0 {
 		t.Fatalf("pool after rebind = %v, want empty", addrs)
 	}
-	if _, learn := c.directOnlyNATPool.beginRefresh(time.Now(), c.directOnlyLinkFingerprint()); !learn {
+	if _, learn, _ := c.directOnlyNATPool.beginRefresh(time.Now(), c.directOnlyLinkFingerprint()); !learn {
 		t.Fatal("rebind did not schedule a learning round")
+	}
+}
+
+// resetOnFirstReadListener opens sockets whose first read fails the way a
+// Windows UDP socket reports an earlier ICMP port unreachable
+// (WSAECONNRESET) when it lacks ICMP error immunity.
+type resetOnFirstReadListener struct {
+	inner nettype.PacketListener
+}
+
+func (l resetOnFirstReadListener) ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error) {
+	pc, err := l.inner.ListenPacket(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	return &resetOnFirstReadConn{PacketConn: pc}, nil
+}
+
+type resetOnFirstReadConn struct {
+	net.PacketConn
+	reads atomic.Int32
+}
+
+func (c *resetOnFirstReadConn) ReadFromUDPAddrPort(b []byte) (int, netip.AddrPort, error) {
+	if c.reads.Add(1) == 1 {
+		return 0, netip.AddrPort{}, &net.OpError{Op: "read", Net: "udp", Err: syscall.ECONNRESET}
+	}
+	return c.PacketConn.(nettype.PacketConn).ReadFromUDPAddrPort(b)
+}
+
+func (c *resetOnFirstReadConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
+	return c.PacketConn.(nettype.PacketConn).WriteToUDPAddrPort(b, addr)
+}
+
+func TestDirectOnlyPoolProbeSurvivesTransientReadErrors(t *testing.T) {
+	stunAddr, cleanup := stuntest.Serve(t)
+	t.Cleanup(cleanup)
+	destination := netip.MustParseAddrPort(stunAddr.String())
+	options := directOnlyTestOptions(t)
+	options.DirectSTUNEndpoints = []netip.AddrPort{destination}
+	options.TestOnlyPacketListener = resetOnFirstReadListener{inner: localhostListener{}}
+	c, err := NewConn(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), directOnlyPoolProbeTimeout)
+	defer cancel()
+	observations := c.probeDirectOnlyPoolSocket(ctx, []netip.AddrPort{destination})
+	if len(observations) != 1 || observations[0].destination != destination || !observations[0].mapped.IsValid() {
+		t.Fatalf("observations after a transient read error = %+v, want one answer from %v", observations, destination)
+	}
+}
+
+// TestDirectOnlyNATPoolResistsForgedSTUN lists a lying STUN server that
+// answers every request with a new forged address on the real mapped port.
+// No forged address may enter the pool, the real pool addresses must still
+// be advertised ahead of all but the current first responder's answer, and
+// the direct path must form.
+func TestDirectOnlyNATPoolResistsForgedSTUN(t *testing.T) {
+	if testing.Short() {
+		t.Skip("multi-second natlab rendezvous measurement")
+	}
+	liar := new(forgingSTUN)
+	// Both honest servers see the first pool address; the host sees the
+	// second (bit 3: destinations 0-2 are the STUN servers).
+	lab, remoteNAT := newDirectOnlyPoolLab(t, 0b1000, liar)
+	listener := &recordingListener{inner: lab.remote, armed: true, mainPort: directOnlyPoolLabRemotePort}
+	host := lab.newPeer("host", lab.host, newDirectOnlyLabIdentity(1), 0)
+	remote := lab.newPeer("remote", listener, newDirectOnlyLabIdentity(2), directOnlyPoolLabRemotePort)
+	defer host.Close()
+	defer remote.Close()
+	hostEndpoints := host.waitEndpoints(t)
+	remote.waitEndpoints(t)
+	var real []netip.AddrPort
+	for _, wan := range remoteNAT.wan {
+		real = append(real, netip.AddrPortFrom(wan.V4(), directOnlyPoolLabRemotePort))
+	}
+	// Several refreshes, each forging a new address.
+	for range 4 {
+		remote.conn.ReSTUN("test-forged-refresh")
+		time.Sleep(200 * time.Millisecond)
+	}
+	addrs, _ := remote.conn.directOnlyNATPool.snapshot(time.Now())
+	for _, addr := range addrs {
+		if liar.isForged(addr) {
+			t.Errorf("forged address %v entered the pool %v", addr, addrs)
+		}
+	}
+	endpoints := remote.latestEndpoints()
+	liar.mu.Lock()
+	lab.logf("forged answers so far: %d", len(liar.forged))
+	liar.mu.Unlock()
+	var order []netip.AddrPort
+	for _, endpoint := range endpoints {
+		if endpoint.Type == tailcfg.EndpointSTUN {
+			order = append(order, endpoint.Addr)
+		}
+	}
+	lastReal, forgedBefore := -1, 0
+	for index, addr := range order {
+		if slices.Contains(real, addr) {
+			lastReal = index
+		}
+	}
+	for _, addr := range order[:max(lastReal, 0)] {
+		if liar.isForged(addr.Addr()) {
+			forgedBefore++
+		}
+	}
+	for _, want := range real {
+		if !slices.Contains(order, want) {
+			t.Errorf("real pool candidate %v not advertised: %v", want, order)
+		}
+	}
+	// Only the current report's first responder (possibly the liar) may
+	// precede a real address; cached forged answers follow them.
+	lab.logf("advertised STUN candidates in order: %v", order)
+	if forgedBefore > 1 {
+		t.Errorf("%d forged candidates precede a real one: %v", forgedBefore, order)
+	}
+	host.mustInstall(t, remote, 2, endpoints)
+	remote.mustInstall(t, host, 1, hostEndpoints)
+	if transit := firstTransit(remote, host, time.Now(), 15*time.Second); transit < 0 {
+		t.Fatal("remote never reached the host directly")
+	}
+	if counters := remote.conn.DirectOnlyCounters(); counters != (DirectOnlyCounters{}) {
+		t.Errorf("forbidden transport attempted: %+v", counters)
 	}
 }

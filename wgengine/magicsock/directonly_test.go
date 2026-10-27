@@ -187,24 +187,31 @@ func TestDirectOnlySTUNUsesOnlyConfiguredDestinationsWithoutDERP(t *testing.T) {
 	}
 }
 
-// TestDirectOnlyAdvertisesEveryPerDestinationPublicAddress models a NAT that
-// preserves the mapped port but picks the public IPv4 address per destination
-// from a pool. Each address is seen by only one STUN destination, so upstream
-// GetGlobalAddrs would keep just the first; direct-only must advertise all of
-// them, on every refresh, without touching any non-configured destination.
-func TestDirectOnlyAdvertisesEveryPerDestinationPublicAddress(t *testing.T) {
+// TestDirectOnlyAdvertisesEveryVouchedPerDestinationPublicAddress models a
+// NAT that preserves the mapped port but picks the public IPv4 address per
+// destination from a pool. Each pool address is seen by two STUN
+// destinations, so upstream GetGlobalAddrs would keep all of them only by
+// chance of counting; direct-only must advertise all of them, on every
+// refresh, without touching any non-configured destination. An address only
+// one destination reported is not vouched for: it is advertised only as the
+// first responder, never through the pool.
+func TestDirectOnlyAdvertisesEveryVouchedPerDestinationPublicAddress(t *testing.T) {
 	const mappedPort = 41641
-	mapped := []netip.AddrPort{
-		netip.AddrPortFrom(netip.MustParseAddr("203.0.113.177"), mappedPort),
-		netip.AddrPortFrom(netip.MustParseAddr("203.0.113.185"), mappedPort),
-		netip.AddrPortFrom(netip.MustParseAddr("203.0.113.190"), mappedPort),
-		// A hard-NAT style singular mapping on another port stays excluded.
-		netip.AddrPortFrom(netip.MustParseAddr("203.0.113.200"), mappedPort+1),
+	pool := []netip.AddrPort{
+		netip.AddrPortFrom(netip.MustParseAddr("45.0.0.177"), mappedPort),
+		netip.AddrPortFrom(netip.MustParseAddr("45.0.0.185"), mappedPort),
+		netip.AddrPortFrom(netip.MustParseAddr("45.0.0.190"), mappedPort),
 	}
+	// A single (possibly lying) destination's same-port answer, and a
+	// hard-NAT style singular mapping on another port.
+	single := netip.AddrPortFrom(netip.MustParseAddr("45.0.0.195"), mappedPort)
+	hardNAT := netip.AddrPortFrom(netip.MustParseAddr("45.0.0.200"), mappedPort+1)
 	var stunEndpoints []netip.AddrPort
-	for _, value := range mapped {
-		stunEndpoints = append(stunEndpoints, serveMappedSTUN(t, value))
+	for _, value := range pool {
+		stunEndpoints = append(stunEndpoints, serveMappedSTUN(t, value), serveMappedSTUN(t, value))
 	}
+	stunEndpoints = append(stunEndpoints, serveMappedSTUN(t, single))
+	stunEndpoints = append(stunEndpoints, serveMappedSTUN(t, hardNAT))
 	c := newDirectOnlySTUNTestConn(t, stunEndpoints)
 
 	// The second report would be incremental, and probe only the fastest
@@ -223,16 +230,25 @@ func TestDirectOnlyAdvertisesEveryPerDestinationPublicAddress(t *testing.T) {
 			}
 		}
 		slices.SortFunc(stun, netip.AddrPort.Compare)
-		// The first responder is always kept; whichever destination that is,
-		// all three same-port addresses must be present. The different-port
-		// mapping may appear only if it happened to be the first responder.
-		for _, want := range mapped[:3] {
+		for _, want := range pool {
 			if !slices.Contains(stun, want) {
 				t.Fatalf("round %d STUN endpoints = %v, missing per-destination address %v", round, stun, want)
 			}
 		}
-		if len(stun) != 3 && !(len(stun) == 4 && slices.Contains(stun, mapped[3])) {
-			t.Fatalf("round %d STUN endpoints = %v, want exactly the three same-port addresses", round, stun)
+		// The first responder is always kept by upstream netcheck, so a
+		// singular answer may appear only in that role; endpoint caching
+		// may carry an earlier round's first responder too.
+		extra := 0
+		for _, addr := range stun {
+			if !slices.Contains(pool, addr) {
+				extra++
+			}
+		}
+		if extra > round+1 {
+			t.Fatalf("round %d STUN endpoints = %v, want the pool plus at most the first responders", round, stun)
+		}
+		if addrs, _ := c.directOnlyNATPool.snapshot(time.Now()); slices.Contains(addrs, single.Addr()) || slices.Contains(addrs, hardNAT.Addr()) {
+			t.Fatalf("round %d pool %v admitted a single-destination address", round, addrs)
 		}
 		// Endpoint caching could mask a skipped destination, so also
 		// require that this round's own report heard from every one.

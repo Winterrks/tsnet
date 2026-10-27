@@ -1154,9 +1154,10 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	// runs beside the report to discover the NAT's public address pool.
 	var poolGeneration uint64
 	var poolLearned chan bool
+	var poolRemembered []netip.Addr
 	if c.directOnly {
 		var learn bool
-		poolGeneration, learn = c.directOnlyNATPool.beginRefresh(time.Now(), c.directOnlyLinkFingerprint())
+		poolGeneration, learn, poolRemembered = c.directOnlyNATPool.beginRefresh(time.Now(), c.directOnlyLinkFingerprint())
 		if learn {
 			poolLearned = make(chan bool, 1)
 			go func() { poolLearned <- c.probeDirectOnlyNATPool(ctx, poolGeneration) }()
@@ -1184,11 +1185,15 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 		return nil, err
 	}
 	if c.directOnly {
-		mapped := make([]netip.AddrPort, 0, len(report.GlobalV4Counters))
-		for ap := range report.GlobalV4Counters {
-			mapped = append(mapped, ap)
+		main := c.directOnlyMainObservations(report)
+		var reset bool
+		if poolGeneration, reset = c.directOnlyNATPool.resetIfUnrelated(poolGeneration, main, poolRemembered); reset {
+			// The network changed under the same socket and link
+			// fingerprint; learn the new pool on the next refresh.
+			c.logf("magicsock: direct-only NAT pool reset: main socket mappings share no remembered address")
+			c.ReSTUN("direct-only-nat-pool-reset")
 		}
-		c.directOnlyNATPool.observe(time.Now(), poolGeneration, mapped)
+		c.directOnlyNATPool.observe(time.Now(), poolGeneration, main)
 	}
 
 	c.lastNetCheckReport.Store(report)
@@ -1491,9 +1496,8 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 		addAddr(addr, tailcfg.EndpointSTUN)
 	}
 	if c.directOnly {
-		for _, addr := range directOnlyExtraGlobalAddrs(nr) {
-			addAddr(addr, tailcfg.EndpointSTUN)
-		}
+		// The main socket's current addresses above come first; pool
+		// addresses follow, each vouched for by two destinations.
 		for _, addr := range c.directOnlyPoolEndpoints(nr) {
 			addAddr(addr, tailcfg.EndpointSTUN)
 		}
@@ -1784,33 +1788,6 @@ func directOnlySTUNMap(endpoints []netip.AddrPort) *tailcfg.DERPMap {
 		OmitDefaultRegions: true,
 		Regions:            regions,
 	}
-}
-
-// directOnlyExtraGlobalAddrs returns observed server-reflexive addresses that
-// [netcheck.Report.GetGlobalAddrs] omits because only one destination
-// reported them, but whose mapped port was reported by at least two
-// destinations in the same family. Such NATs keep a consistent mapped port and
-// choose the public address per destination, so each address is a real
-// candidate for some peer path. A singular observation whose port no other
-// destination saw remains excluded, as it is likely a per-destination
-// hard-NAT mapping. The result is sorted.
-func directOnlyExtraGlobalAddrs(nr *netcheck.Report) []netip.AddrPort {
-	var extra []netip.AddrPort
-	add := func(preferred netip.AddrPort, counters map[netip.AddrPort]int) {
-		portObservations := make(map[uint16]int, len(counters))
-		for addr, count := range counters {
-			portObservations[addr.Port()] += count
-		}
-		for addr, count := range counters {
-			if count == 1 && addr != preferred && portObservations[addr.Port()] >= 2 {
-				extra = append(extra, addr)
-			}
-		}
-	}
-	add(nr.GlobalV4, nr.GlobalV4Counters)
-	add(nr.GlobalV6, nr.GlobalV6Counters)
-	slices.SortFunc(extra, netip.AddrPort.Compare)
-	return extra
 }
 
 var errDropDerpPacket = errors.New("too many DERP packets queued; dropping")

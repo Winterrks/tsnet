@@ -68,45 +68,61 @@ and only then removes the peer. Other approved pair edges remain installed.
 An approved peer that cannot establish direct UDP before the caller's deadline
 returns `ErrWaifusDirectUnavailable`; no relay attempt follows.
 
-Public endpoint discovery uses a fixed list of one to eight distinct
-IP-literal STUN destinations, copied at construction. The fork supplies them to
-netcheck through a transient STUN-only descriptor with one region per
-destination; it is never installed as a DERP map, and send-time enforcement
-rejects every netcheck destination outside the list. Every refresh probes every
-listed destination (netcheck `ProbeAllRegions`) instead of only the fastest
-few, because some NATs keep the mapped port but choose the public IPv4 address
-per destination from a pool. Each observed server-reflexive address whose port
-is consistent across destinations is advertised as a direct candidate, even
-when only one destination reported it; singular observations on an
-inconsistent port stay excluded as likely hard-NAT mappings. LAN gateway port
+Public endpoint discovery uses a fixed list of one to eight distinct IP-literal
+STUN destinations, copied at construction. The fork supplies them to netcheck
+through a transient STUN-only descriptor with one region per destination; it is
+never installed as a DERP map, and send-time enforcement rejects every netcheck
+destination outside the list. Every refresh probes every listed destination
+(netcheck `ProbeAllRegions`, which also records which region reported which
+IPv4 mapping) instead of only the fastest few, because some NATs keep the
+mapped port but choose the public IPv4 address per destination from a pool. The
+main socket's own current addresses (netcheck's first responder and every
+address several destinations reported) are advertised first. LAN gateway port
 mapping and validated direct peer candidates remain available for NAT traversal
 and network mobility.
 
 Such a pool NAT's choice is sticky per socket and destination, so the main
 socket can see one address on every STUN destination while its traffic to the
 peer leaves through another, which the peer's address-and-port dependent filter
-then drops. Direct-only magicsock therefore remembers every public IPv4 address
-observed on the current network (at most eight, each forgotten after 30 minutes
-unobserved, and all cleared on a rebind, network loss, or change of the
-default-route interface or its addresses). When the main socket's observations
-share one mapped port and that port either equals the local port or some socket
-on this network saw two pool addresses with one port, each remembered address
-is advertised as a server-reflexive candidate with the current mapped port. To
+then drops. Direct-only magicsock therefore tracks every public IPv4 address
+observed on the current network, with the distinct STUN destinations that
+reported it. An address is admitted to the pool only after two different
+destinations reported it (from any socket), so one lying or spoofed STUN
+destination cannot add one; addresses in reserved, private, shared,
+documentation, benchmarking, multicast, or Tailscale ranges are never tracked.
+At most eight addresses are admitted and sixteen tracked (unadmitted ones are
+evicted first), each is forgotten after 30 minutes unobserved, and the pool is
+cleared on a rebind, network loss, a change of the default-route interface or
+its addresses, or a main-socket report that shares no address with it (a
+network change under the same interface and local address). When the main
+socket's observations of admitted addresses share one mapped port and that port
+either equals the local port or one socket saw two admitted addresses with one
+port, each admitted address is advertised, after the main socket's own
+addresses, as a server-reflexive candidate with the current mapped port. To
 learn the pool quickly, the first refresh on a network (and, at most once a
-minute, any refresh while no round has been answered yet or a remembered
-address has gone 15 minutes unobserved) also runs a learning round beside the
-regular report: three short-lived extra UDP sockets each send a binding
-request, retransmitted at most twice, to every IPv4 destination of the same
-fixed STUN list and are closed within two seconds. Only the public addresses
-they observe are kept; their own ports are never advertised. Their sends go
-through the same allow-list as netcheck and count against the egress tripwire
-otherwise, and the source audit pins the guard and the two socket-open sites.
+minute, any refresh while no round has been answered yet or an admitted address
+has gone 15 minutes unobserved) also runs a learning round beside the regular
+report: three short-lived extra UDP sockets, made immune to ICMP-induced read
+errors like the main sockets, each send a binding request, retransmitted at
+most twice, to every IPv4 destination of the same fixed STUN list and are
+closed within two seconds. Only the public addresses they observe are kept;
+their own ports are never advertised. Their sends go through the same
+allow-list as netcheck and count against the egress tripwire otherwise, and the
+source audit pins the guard, the ICMP setting, and the two socket-open sites.
 In the in-memory two-NAT lab
 (`wgengine/magicsock/directonly_natpool_lab_test.go`: a two-address
 port-preserving pool NAT against a single-address port-preserving host NAT,
-both address-and-port dependent), the previous fork connected in only six of
-the eight main-socket assignments and advertised both addresses in four; with
-pool learning every assignment advertises both and connects at once.
+both address-and-port dependent), the fork before pool learning connected in
+only six of the eight main-socket assignments and advertised both addresses in
+four; with pool learning every assignment advertises both and connects at once.
+A listed STUN server that forges a new address on the real port for every
+request gets none into the pool.
+
+Privacy: the STUN operators of the helper's compiled list (Cloudflare, Google,
+Twilio, Nextcloud, sipgate, and BlackBerry) see the device's public address and
+mapped port on every refresh. Because the helper prefers a stable per-pair UDP
+port, they can link the same device across networks and over time; they see no
+identity, pairing, or application data.
 
 While a direct-only instance has an authorized peer, a node key, and an online
 network, its existing randomized 20–26-second STUN refresh remains active during

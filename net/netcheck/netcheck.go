@@ -119,6 +119,13 @@ type Report struct {
 	GlobalV4Counters map[netip.AddrPort]int // number of times the endpoint was observed
 	GlobalV6Counters map[netip.AddrPort]int // number of times the endpoint was observed
 
+	// GlobalV4ByRegion maps each region whose STUN probe answered over IPv4
+	// to the first mapping it reported. It is recorded only for reports made
+	// with GetReportOpts.ProbeAllRegions, whose small fixed STUN-only
+	// descriptor has one destination per region, so that a caller can tell
+	// how many distinct destinations reported each mapping.
+	GlobalV4ByRegion map[int]netip.AddrPort
+
 	GlobalV4 netip.AddrPort
 	GlobalV6 netip.AddrPort
 
@@ -181,6 +188,7 @@ func (r *Report) Clone() *Report {
 	r2.RegionV6Latency = maps.Clone(r2.RegionV6Latency)
 	r2.GlobalV4Counters = maps.Clone(r2.GlobalV4Counters)
 	r2.GlobalV6Counters = maps.Clone(r2.GlobalV6Counters)
+	r2.GlobalV4ByRegion = maps.Clone(r2.GlobalV4ByRegion)
 	return &r2
 }
 
@@ -689,6 +697,9 @@ func (rs *reportState) addNodeLatency(node *tailcfg.DERPNode, ipp netip.AddrPort
 		updateLatency(ret.RegionV4Latency, node.RegionID, d)
 		ret.IPv4 = true
 		mak.Set(&ret.GlobalV4Counters, ipp, ret.GlobalV4Counters[ipp]+1)
+		if _, ok := ret.GlobalV4ByRegion[node.RegionID]; rs.probeAll && !ok {
+			mak.Set(&ret.GlobalV4ByRegion, node.RegionID, ipp)
+		}
 		if !rs.gotEP4.IsValid() {
 			rs.gotEP4 = ipp
 			ret.GlobalV4 = ipp

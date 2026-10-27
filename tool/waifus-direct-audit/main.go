@@ -146,6 +146,12 @@ func auditRepository(root string) []error {
 		{
 			file:   "wgengine/magicsock/directonly_natpool.go",
 			name:   "probeDirectOnlyPoolSocket",
+			before: "sockopts.SetICMPErrImmunity(pc)",
+			after:  "c.sendDirectOnlyPoolProbe(pc, stun.Request(txID), destination)",
+		},
+		{
+			file:   "wgengine/magicsock/directonly_natpool.go",
+			name:   "probeDirectOnlyPoolSocket",
 			before: "pc.Close()",
 			after:  "c.sendDirectOnlyPoolProbe(pc, stun.Request(txID), destination)",
 		},

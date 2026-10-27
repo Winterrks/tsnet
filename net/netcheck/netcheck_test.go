@@ -1134,6 +1134,27 @@ func TestProbeAllRegions(t *testing.T) {
 				case !probeAll && round == 1 && got >= len(stunAddrs):
 					t.Fatalf("incremental default report answered all regions %v; test no longer distinguishes ProbeAllRegions", r.RegionLatency)
 				}
+				// Only a probe-all report records which region reported
+				// which IPv4 mapping.
+				if !probeAll {
+					if r.GlobalV4ByRegion != nil {
+						t.Fatalf("round %d default report recorded per-region mappings %v", round, r.GlobalV4ByRegion)
+					}
+					continue
+				}
+				if len(r.GlobalV4ByRegion) != len(stunAddrs) {
+					t.Fatalf("round %d per-region mappings = %v, want one per region", round, r.GlobalV4ByRegion)
+				}
+				for regionID, mapped := range r.GlobalV4ByRegion {
+					if r.RegionV4Latency[regionID] == 0 || r.GlobalV4Counters[mapped] == 0 {
+						t.Fatalf("round %d region %d mapping %v is not an answered IPv4 observation", round, regionID, mapped)
+					}
+				}
+				clone := r.Clone()
+				clear(clone.GlobalV4ByRegion)
+				if len(r.GlobalV4ByRegion) != len(stunAddrs) {
+					t.Fatal("Clone shares GlobalV4ByRegion")
+				}
 			}
 		})
 	}

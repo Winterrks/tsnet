@@ -80,42 +80,22 @@ func TestDirectOnlySTUNMapPutsEachDestinationInItsOwnSTUNOnlyRegion(t *testing.T
 	}
 }
 
-func TestDirectOnlyExtraGlobalAddrs(t *testing.T) {
-	preferred := netip.MustParseAddrPort("203.0.113.177:41641")
-	poolPeer := netip.MustParseAddrPort("203.0.113.185:41641")
-	repeated := netip.MustParseAddrPort("203.0.113.190:41641")
-	hardNAT := netip.MustParseAddrPort("203.0.113.200:50000")
-	v6 := netip.MustParseAddrPort("[2001:db8::1]:41641")
-	report := &netcheck.Report{
-		GlobalV4: preferred,
-		GlobalV4Counters: map[netip.AddrPort]int{
-			preferred: 1,
-			poolPeer:  1,
-			repeated:  2,
-			hardNAT:   1,
-		},
-		GlobalV6:         v6,
-		GlobalV6Counters: map[netip.AddrPort]int{v6: 1},
+func TestDirectOnlyMainObservationsNameEachRegionsDestination(t *testing.T) {
+	c := &Conn{directSTUNEndpoints: []netip.AddrPort{
+		netip.MustParseAddrPort("9.9.9.1:3478"),
+		netip.MustParseAddrPort("9.9.9.2:19302"),
+		netip.MustParseAddrPort("[2606:4700::1]:3478"),
+	}}
+	report := &netcheck.Report{GlobalV4ByRegion: map[int]netip.AddrPort{
+		1: netip.MustParseAddrPort("45.0.0.177:41641"),
+		2: netip.MustParseAddrPort("45.0.0.185:41641"),
+		9: netip.MustParseAddrPort("46.0.0.1:41641"), // not a listed region
+	}}
+	want := []directOnlyPoolObservation{
+		{destination: c.directSTUNEndpoints[0], mapped: netip.MustParseAddrPort("45.0.0.177:41641")},
+		{destination: c.directSTUNEndpoints[1], mapped: netip.MustParseAddrPort("45.0.0.185:41641")},
 	}
-	if got, want := directOnlyExtraGlobalAddrs(report), []netip.AddrPort{poolPeer}; !slices.Equal(got, want) {
-		t.Fatalf("extra global addresses = %v, want %v", got, want)
-	}
-
-	// Port consistency, not the first responder, decides: an odd-port
-	// first responder must not hide the consistent per-destination pool.
-	report = &netcheck.Report{
-		GlobalV4: hardNAT,
-		GlobalV4Counters: map[netip.AddrPort]int{
-			hardNAT:   1,
-			preferred: 1,
-			poolPeer:  1,
-		},
-	}
-	if got, want := directOnlyExtraGlobalAddrs(report), []netip.AddrPort{preferred, poolPeer}; !slices.Equal(got, want) {
-		t.Fatalf("extra global addresses with odd first responder = %v, want %v", got, want)
-	}
-
-	if got := directOnlyExtraGlobalAddrs(&netcheck.Report{}); len(got) != 0 {
-		t.Fatalf("empty report extra addresses = %v", got)
+	if got := c.directOnlyMainObservations(report); !slices.Equal(got, want) {
+		t.Fatalf("main observations = %+v, want %+v", got, want)
 	}
 }
