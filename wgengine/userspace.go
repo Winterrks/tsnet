@@ -445,10 +445,15 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 
 		e.RequestStatus()
 	}
+	var directPathUp func(key.NodePublic)
+	if conf.DirectOnly {
+		directPathUp = e.startDirectOnlyHandshake
+	}
 	magicsockOpts := magicsock.Options{
 		DirectOnly:          conf.DirectOnly,
 		DirectSTUNEndpoints: conf.DirectSTUNEndpoints,
 		ForceNodeKey:        conf.ForceNodeKey,
+		DirectPathUpFunc:    directPathUp,
 		EventBus:            e.eventBus,
 		Logf:                logf,
 		Port:                conf.ListenPort,
@@ -1021,6 +1026,24 @@ func (e *userspaceEngine) getStatusCallback() StatusCallback {
 }
 
 var ErrEngineClosing = errors.New("engine closing; no status")
+
+// startDirectOnlyHandshake starts a WireGuard handshake with an authorized
+// peer as soon as magicsock first validates a direct path to it. Without DERP,
+// a peer whose process restarted would otherwise keep sending with stale
+// session keys until wireguard-go's keepalive timeout forces a new handshake,
+// and a fresh process would wait for its next handshake retransmission. The
+// handshake travels only over the validated direct path.
+func (e *userspaceEngine) startDirectOnlyHandshake(peerKey key.NodePublic) {
+	wgDevice := e.wgdev
+	if wgDevice == nil {
+		return
+	}
+	peer := wgDevice.LookupPeer(peerKey.Raw32())
+	if peer == nil {
+		return
+	}
+	_ = peer.SendHandshakeInitiation(false)
+}
 
 func (e *userspaceEngine) PeerByKey(pubKey key.NodePublic) (_ wgint.Peer, ok bool) {
 	e.wgLock.Lock()

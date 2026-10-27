@@ -91,6 +91,35 @@ This bounded retry replaces the missing idle DERP wake-up path; it sends no
 application payload or extra coordination message. Removed/expired peers are not
 probed, and offline, homeless, keyless, or closed instances stop probing.
 
+Path formation does not wait for scheduled retries either. An authenticated
+disco ping from a peer that has no trusted direct path is answered at once with
+a ping back to its source, outside the regular per-endpoint interval but at
+most once per second per address: the peer's NAT is evidently open toward that
+address, which is exactly what a DERP `CallMeMaybe` would have announced. While
+no trusted direct path exists, magicsock keeps a copy of the most recent
+WireGuard handshake initiation or response it was asked to send (one message,
+never transport data, at most five seconds old) and sends it over the direct
+address as soon as a disco pong validates one, instead of leaving it to
+wireguard-go's five-second retransmission. The first time a direct path to a
+peer validates, the engine also starts a WireGuard handshake through the new
+`magicsock.Options.DirectPathUpFunc` hook, unless a handshake is already in
+flight in either direction; a peer that restarted therefore replaces stale
+session keys immediately instead of after wireguard-go's 15-second keepalive
+timeout. All three only ever send to a direct address validated by a disco
+pong. `wgengine/magicsock/directonly_rendezvous_test.go` measures the effect on
+an in-memory two-NAT topology (endpoint-independent mapping, address-and-port
+dependent filtering, no DERP):
+
+| case (coordination delay) | before | after |
+| --- | --- | --- |
+| first contact (1 s) | 5.0 s | 1.0 s |
+| first contact (3 s) | 10.3 s | 3.0 s |
+| remote restart, new port (1 s) | 5.0 s | 1.0 s |
+| remote restart, new port (3 s) | 10.0 s | 3.0 s |
+| remote restart, same port (3 s) | 0.0 s | 0.0 s |
+| host restart, new port (3 s) | 20.3 s | 3.8 s |
+| host restart, same port (3 s) | 15.5 s | 0.8 s |
+
 Ordinary upstream behavior outside Waifus mode must remain unchanged. Runtime
 counters and packet ledgers are regression evidence, not the enforcement
 boundary.
@@ -109,6 +138,8 @@ The intentionally added public seams are:
   `ipnlocal.WithWaifusNetworkMapPolicy`, and
   `ipnlocal.WithWaifusLocalIdentity`, which are construction-only backend
   options.
+- `magicsock.Options.DirectPathUpFunc`, the direct-only first-path handshake
+  hook the engine installs; it is ignored outside direct-only mode.
 - `wgengine.Config.DirectOnly`, its fixed STUN list/node/discovery identity
   fields, `magicsock.MaxDirectSTUNEndpoints`,
   `magicsock.ValidDirectOnlySTUNEndpoints`, and

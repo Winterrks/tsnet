@@ -303,6 +303,7 @@ type Conn struct {
 	directOnly          bool
 	directSTUNEndpoints []netip.AddrPort // immutable copy; never mutated after NewConn
 	directOnlyNodeKey   key.NodePrivate
+	directPathUp        func(key.NodePublic) // immutable; nil outside direct-only mode
 
 	prohibitedDERPAttempts             atomic.Uint64
 	prohibitedPeerRelayAttempts        atomic.Uint64
@@ -566,6 +567,14 @@ type Options struct {
 	// from replacing the process identity.
 	ForceNodeKey key.NodePrivate
 
+	// DirectPathUpFunc, if non-nil, is called (in its own goroutine) at
+	// most once per peer endpoint in DirectOnly mode, the first time a disco
+	// pong validates a direct path to that peer. The engine uses it to start
+	// a WireGuard handshake immediately, so a peer whose process restarted
+	// replaces stale session keys without waiting for the keepalive
+	// timeout. It is ignored outside DirectOnly mode.
+	DirectPathUpFunc func(key.NodePublic)
+
 	// OnDERPRecv, if non-nil, is called for every non-disco packet
 	// received from DERP before the peer map lookup. If it returns
 	// true, the packet is considered handled and is not passed to
@@ -719,6 +728,9 @@ func NewConn(opts Options) (*Conn, error) {
 	c.directOnly = opts.DirectOnly
 	c.directSTUNEndpoints = slices.Clone(opts.DirectSTUNEndpoints)
 	c.directOnlyNodeKey = opts.ForceNodeKey
+	if c.directOnly {
+		c.directPathUp = opts.DirectPathUpFunc
+	}
 	if c.directOnly {
 		c.relayManager.disable(&c.prohibitedPeerRelayAttempts)
 	}
@@ -2170,6 +2182,9 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
 	}
 	now := mono.Now()
 	ep.lastRecvUDPAny.StoreAtomic(now)
+	if c.directOnly && looksLikeHandshakeMsg(b) {
+		ep.lastRecvHandshake.StoreAtomic(now)
+	}
 	connNoted := ep.noteRecvActivity(src, now)
 	if buildfeatures.HasNetLog {
 		if update := c.connCounter.Load(); update != nil {
@@ -2855,6 +2870,7 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 
 	// Remember this route if not present.
 	var dup bool
+	var rendezvous *endpoint
 	if isDerp {
 		if _, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
 			numNodes = 1
@@ -2869,6 +2885,7 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 			if numNodes == 1 && dstKey.IsZero() {
 				dstKey = ep.publicKey
 			}
+			rendezvous = ep
 			return true
 		})
 		if dup {
@@ -2900,6 +2917,13 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 		TxID: dm.TxID,
 		Src:  src.ap,
 	}, discoVerboseLog)
+	if c.directOnly && !isDerp && numNodes == 1 && rendezvous != nil {
+		// Without DERP there is no CallMeMaybe. An authenticated ping that
+		// reached us proves the peer is probing this path now and that its
+		// NAT is open toward the address it sent from, so ping back at once
+		// instead of waiting out the regular per-endpoint interval.
+		rendezvous.answerDirectOnlyRendezvous(src.ap)
+	}
 }
 
 // enqueueCallMeMaybe schedules a send of disco.CallMeMaybe to de via derpAddr
@@ -4761,6 +4785,9 @@ func (le *lazyEndpoint) InitiationMessagePublicKey(peerPublicKey [32]byte) {
 	}
 	now := mono.Now()
 	ep.lastRecvUDPAny.StoreAtomic(now)
+	if le.c.directOnly {
+		ep.lastRecvHandshake.StoreAtomic(now)
+	}
 	ep.noteRecvActivity(le.src, now)
 }
 

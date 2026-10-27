@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tailscale/wireguard-go/device"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"tailscale.com/disco"
@@ -64,6 +65,7 @@ type endpoint struct {
 	// atomically accessed; declared first for alignment reasons
 	lastRecvWG            mono.Time // last time there were incoming packets from this peer destined for wireguard-go (e.g. not disco)
 	lastRecvUDPAny        mono.Time // last time there were incoming UDP packets from this peer of any kind
+	lastRecvHandshake     mono.Time // direct-only: last time a WireGuard handshake message arrived from this peer
 	numStopAndResetAtomic int64
 	debugUpdates          *ringlog.RingLog[EndpointChange]
 
@@ -104,10 +106,160 @@ type endpoint struct {
 	expired         bool // whether the node has expired
 	isWireguardOnly bool // whether the endpoint is WireGuard only
 	relayCapable    bool // whether the node is capable of speaking via a [tailscale.com/net/udprelay.Server]
+
+	// Direct-only rendezvous state. Without DERP, the WireGuard handshake
+	// message that wireguard-go sends while no direct path is validated is
+	// otherwise lost until its own five-second retransmission. The most
+	// recent such message is held (one message, bounded age) and sent over
+	// the direct path as soon as a disco pong validates it.
+	heldHandshake     []byte    // copy of one WireGuard handshake message, or nil
+	heldHandshakeAt   mono.Time // when heldHandshake was produced
+	directPathUpFired bool      // Conn.directPathUp has run for this endpoint
 }
+
+const (
+	// directOnlyRendezvousPingInterval bounds how often an inbound disco
+	// ping from a peer without a trusted direct path makes us ping that
+	// source back. It is deliberately shorter than discoPingInterval: the
+	// peer's ping usually arrives just after our own last (filtered) ping.
+	directOnlyRendezvousPingInterval = time.Second
+
+	// directOnlyHandshakeHoldTime is how long a held WireGuard handshake
+	// message stays eligible to be sent once a path validates. It matches
+	// wireguard-go's RekeyTimeout, after which wireguard-go sends a fresh
+	// handshake message itself.
+	directOnlyHandshakeHoldTime = 5 * time.Second
+
+	// directOnlyPathUpDelay is how long after the first direct path
+	// validation Conn.directPathUp waits before running. When both peers
+	// validate at once, the side with traffic usually sends a held handshake
+	// within that time; the other side then sees it arrive and skips its own,
+	// avoiding simultaneous initiations that wireguard-go resolves only on
+	// its next retransmission.
+	directOnlyPathUpDelay = 500 * time.Millisecond
+)
 
 func (de *endpoint) isDirectOnly() bool {
 	return de.c != nil && de.c.directOnly
+}
+
+// answerDirectOnlyRendezvous pings src right away when an authenticated disco
+// ping arrived from it and this peer has no trusted direct path. It replaces
+// the DERP CallMeMaybe a non-direct-only node would have received: the peer's
+// NAT is evidently open toward src now, so an answer sent after its ping gets
+// through even when our own scheduled ping, sent moments earlier, was
+// filtered. The answer is independent of the regular per-endpoint discovery
+// interval, but answers to one address are spaced at least
+// directOnlyRendezvousPingInterval apart. A pong establishes trust and ends
+// the exchange; if pongs are lost, two peers answering each other cannot loop
+// faster than that interval.
+func (de *endpoint) answerDirectOnlyRendezvous(src netip.AddrPort) {
+	if !de.isDirectOnly() {
+		return
+	}
+	de.mu.Lock()
+	defer de.mu.Unlock()
+	if de.expired || de.disco.Load() == nil {
+		return
+	}
+	now := mono.Now()
+	if de.bestAddr.isDirect() && !now.After(de.trustBestAddrUntil) {
+		return
+	}
+	st, ok := de.endpointState[src]
+	if !ok {
+		return
+	}
+	if !st.lastRendezvousAnswer.IsZero() && now.Sub(st.lastRendezvousAnswer) < directOnlyRendezvousPingInterval {
+		return
+	}
+	st.lastRendezvousAnswer = now
+	de.startDiscoPingLocked(epAddr{ap: src}, now, pingDiscovery, 0, nil)
+}
+
+// holdDirectOnlyHandshakeLocked keeps a copy of the last WireGuard handshake
+// initiation or response in buffs, which is being sent while no trusted
+// direct path exists. Transport data is never held.
+//
+// de.mu must be held.
+func (de *endpoint) holdDirectOnlyHandshakeLocked(now mono.Time, buffs [][]byte, offset int) {
+	for index := len(buffs) - 1; index >= 0; index-- {
+		if len(buffs[index]) < offset {
+			continue
+		}
+		message := buffs[index][offset:]
+		if !looksLikeHandshakeMsg(message) {
+			continue
+		}
+		de.heldHandshake = append(de.heldHandshake[:0], message...)
+		de.heldHandshakeAt = now
+		return
+	}
+}
+
+// takeHeldDirectOnlyHandshakeLocked returns and clears the held handshake
+// message if it is still within directOnlyHandshakeHoldTime.
+//
+// de.mu must be held.
+func (de *endpoint) takeHeldDirectOnlyHandshakeLocked(now mono.Time) []byte {
+	held, at := de.heldHandshake, de.heldHandshakeAt
+	de.heldHandshake, de.heldHandshakeAt = nil, 0
+	if len(held) == 0 || now.Sub(at) > directOnlyHandshakeHoldTime {
+		return nil
+	}
+	return held
+}
+
+// directOnlyPathValidatedLocked runs after a direct disco pong has been
+// processed. When that pong newly validated a direct path (none before, an
+// expired one, or a different address), it sends any held handshake message
+// over the path, and on the first validation for this endpoint it lets the
+// engine start a WireGuard handshake. Both only use the validated direct
+// address; nothing is ever relayed.
+//
+// de.mu must be held.
+func (de *endpoint) directOnlyPathValidatedLocked(now mono.Time, previous epAddr, wasTrusted bool) {
+	current := de.bestAddr.epAddr
+	if !current.isDirect() || now.After(de.trustBestAddrUntil) {
+		return
+	}
+	if wasTrusted && previous == current {
+		return
+	}
+	held := de.takeHeldDirectOnlyHandshakeLocked(now)
+	if held != nil {
+		go de.c.sendUDP(current.ap, held, false, false)
+	}
+	if de.directPathUpFired {
+		return
+	}
+	de.directPathUpFired = true
+	pathUp := de.c.directPathUp
+	if pathUp == nil || held != nil {
+		// A held handshake is already on its way and serves the same purpose.
+		return
+	}
+	time.AfterFunc(directOnlyPathUpDelay, func() {
+		if de.c.connCtx.Err() != nil {
+			return
+		}
+		if received := de.lastRecvHandshake.LoadAtomic(); !received.IsZero() &&
+			mono.Since(received) < directOnlyHandshakeHoldTime {
+			// The peer is already handshaking with us.
+			return
+		}
+		pathUp(de.publicKey)
+	})
+}
+
+// looksLikeHandshakeMsg reports whether b is exactly a WireGuard handshake
+// initiation or response message.
+func looksLikeHandshakeMsg(b []byte) bool {
+	if looksLikeInitiationMsg(b) {
+		return true
+	}
+	return len(b) == device.MessageResponseSize &&
+		binary.LittleEndian.Uint32(b) == device.MessageResponseType
 }
 
 // udpRelayEndpointReady determines whether the given relay [addrQuality] should
@@ -409,6 +561,10 @@ type endpointState struct {
 
 	// lastPing is the last (outgoing) ping time.
 	lastPing mono.Time
+
+	// lastRendezvousAnswer is the last time a direct-only rendezvous ping
+	// was sent to this endpoint in answer to its inbound ping.
+	lastRendezvousAnswer mono.Time
 
 	// lastGotPing, if non-zero, means that this was an endpoint
 	// that we learned about at runtime (from an incoming ping)
@@ -1090,6 +1246,9 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 			de.sendWireGuardOnlyPingsLocked(now)
 		}
 	} else if !udpAddr.isDirect() || now.After(de.trustBestAddrUntil) {
+		if de.isDirectOnly() {
+			de.holdDirectOnlyHandshakeLocked(now, buffs, offset)
+		}
 		de.sendDiscoPingsLocked(now, true)
 		if de.wantUDPRelayPathDiscoveryLocked(now) {
 			de.discoverUDPRelayPathsLocked(now)
@@ -1828,6 +1987,13 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 			wireMTU: pingSizeToPktLen(sp.size, sp.to),
 		}
 		bestUntrusted := now.After(de.trustBestAddrUntil)
+		if de.isDirectOnly() {
+			previous := de.bestAddr.epAddr
+			wasTrusted := previous.isDirect() && !bestUntrusted
+			defer func() {
+				de.directOnlyPathValidatedLocked(now, previous, wasTrusted)
+			}()
+		}
 		if betterAddr(thisPong, de.bestAddr) || bestUntrusted {
 			de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
 			de.debugUpdates.Add(EndpointChange{
