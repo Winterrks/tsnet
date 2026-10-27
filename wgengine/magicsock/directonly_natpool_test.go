@@ -291,24 +291,51 @@ func TestDirectOnlyNATPoolResetsOnUnrelatedMainReport(t *testing.T) {
 	if next != generation || len(remembered) != 2 {
 		t.Fatalf("refresh generation=%d remembered=%v", next, remembered)
 	}
+	at := now.Add(time.Minute)
 	// A report that still sees one remembered address keeps the pool.
-	if got, reset := pool.resetIfUnrelated(next, poolObs(1, "45.0.0.185:41641", 2, "47.0.0.1:41641"), remembered); reset || got != next {
+	if got, reset, _ := pool.resetIfUnrelated(at, next, poolObs(1, "45.0.0.185:41641", 2, "47.0.0.1:41641", 3, "47.0.0.1:41641"), remembered); reset || got != next {
 		t.Fatalf("related report reset the pool (generation %d, reset %v)", got, reset)
 	}
 	// A report without IPv4 observations decides nothing.
-	if _, reset := pool.resetIfUnrelated(next, nil, remembered); reset {
+	if _, reset, _ := pool.resetIfUnrelated(at, next, nil, remembered); reset {
 		t.Fatal("an empty report reset the pool")
 	}
-	// A report sharing no address clears it and needs a new round.
-	got, reset := pool.resetIfUnrelated(next, poolObs(1, "47.0.0.1:41641", 2, "47.0.0.1:41641"), remembered)
-	if !reset || got == next {
-		t.Fatalf("unrelated report kept the pool (generation %d, reset %v)", got, reset)
+	// One destination answering alone (for example a lying one, when the
+	// others are silent) cannot reset the pool, however often it answers.
+	for refresh := range 10 {
+		forged := fmt.Sprintf("46.0.0.%d:41641", refresh+1)
+		if _, reset, _ := pool.resetIfUnrelated(at.Add(time.Duration(refresh)*time.Second), next, poolObs(4, forged), remembered); reset {
+			t.Fatalf("refresh %d: a single destination's answer reset the pool", refresh)
+		}
 	}
-	if addrs, _ := pool.snapshot(now.Add(time.Minute)); len(addrs) != 0 {
+	if addrs, _ := pool.snapshot(at); len(addrs) != 2 {
+		t.Fatalf("pool after single-destination answers = %v, want both addresses", addrs)
+	}
+	// Two destinations agreeing on a new address reset it at once and ask
+	// for an immediate refresh to learn the new pool.
+	got, reset, refresh := pool.resetIfUnrelated(at, next, poolObs(1, "47.0.0.1:41641", 2, "47.0.0.1:41641"), remembered)
+	if !reset || got == next || !refresh {
+		t.Fatalf("genuine network change: generation %d (was %d), reset %v, refresh %v", got, next, reset, refresh)
+	}
+	if addrs, _ := pool.snapshot(at); len(addrs) != 0 {
 		t.Fatalf("pool after unrelated report = %v", addrs)
 	}
-	if _, learn, _ := pool.beginRefresh(now.Add(time.Minute), "link-a"); !learn {
+	if _, learn, _ := pool.beginRefresh(at, "link-a"); !learn {
 		t.Fatal("unrelated report did not schedule a learning round")
+	}
+
+	// Another reset within the round interval still clears the pool but
+	// does not ask for another immediate refresh.
+	pool.observe(at, got, poolObs(1, "47.0.0.1:41641", 2, "47.0.0.1:41641"))
+	again, _, remembered := pool.beginRefresh(at.Add(time.Second), "link-a")
+	_, reset, refresh = pool.resetIfUnrelated(at.Add(time.Second), again, poolObs(1, "48.0.0.1:41641", 2, "48.0.0.1:41641"), remembered)
+	if !reset || refresh {
+		t.Fatalf("second reset within the interval: reset %v refresh %v, want reset without refresh", reset, refresh)
+	}
+	pool.observe(at, got+1, poolObs(1, "48.0.0.1:41641", 2, "48.0.0.1:41641"))
+	later, _, remembered := pool.beginRefresh(at.Add(directOnlyPoolRoundInterval), "link-a")
+	if _, reset, refresh := pool.resetIfUnrelated(at.Add(directOnlyPoolRoundInterval), later, poolObs(1, "49.0.0.1:41641", 2, "49.0.0.1:41641"), remembered); !reset || !refresh {
+		t.Fatalf("reset after the interval: reset %v refresh %v, want both", reset, refresh)
 	}
 }
 

@@ -1186,12 +1186,15 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	}
 	if c.directOnly {
 		main := c.directOnlyMainObservations(report)
-		var reset bool
-		if poolGeneration, reset = c.directOnlyNATPool.resetIfUnrelated(poolGeneration, main, poolRemembered); reset {
+		var reset, refresh bool
+		if poolGeneration, reset, refresh = c.directOnlyNATPool.resetIfUnrelated(time.Now(), poolGeneration, main, poolRemembered); reset {
 			// The network changed under the same socket and link
-			// fingerprint; learn the new pool on the next refresh.
+			// fingerprint; learn the new pool on a refresh, started at
+			// once at most once per round interval.
 			c.logf("magicsock: direct-only NAT pool reset: main socket mappings share no remembered address")
-			c.ReSTUN("direct-only-nat-pool-reset")
+			if refresh {
+				c.ReSTUN("direct-only-nat-pool-reset")
+			}
 		}
 		c.directOnlyNATPool.observe(time.Now(), poolGeneration, main)
 	}

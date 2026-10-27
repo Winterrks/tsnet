@@ -88,28 +88,31 @@ then drops. Direct-only magicsock therefore tracks every public IPv4 address
 observed on the current network, with the distinct STUN destinations that
 reported it. An address is admitted to the pool only after two different
 destinations reported it (from any socket), so one lying or spoofed STUN
-destination cannot add one; addresses in reserved, private, shared,
-documentation, benchmarking, multicast, or Tailscale ranges are never tracked.
-At most eight addresses are admitted and sixteen tracked (unadmitted ones are
-evicted first), each is forgotten after 30 minutes unobserved, and the pool is
-cleared on a rebind, network loss, a change of the default-route interface or
-its addresses, or a main-socket report that shares no address with it (a
-network change under the same interface and local address). When the main
-socket's observations of admitted addresses share one mapped port and that port
-either equals the local port or one socket saw two admitted addresses with one
-port, each admitted address is advertised, after the main socket's own
-addresses, as a server-reflexive candidate with the current mapped port. To
-learn the pool quickly, the first refresh on a network (and, at most once a
-minute, any refresh while no round has been answered yet or an admitted address
-has gone 15 minutes unobserved) also runs a learning round beside the regular
-report: three short-lived extra UDP sockets, made immune to ICMP-induced read
-errors like the main sockets, each send a binding request, retransmitted at
-most twice, to every IPv4 destination of the same fixed STUN list and are
-closed within two seconds. Only the public addresses they observe are kept;
-their own ports are never advertised. Their sends go through the same
-allow-list as netcheck and count against the egress tripwire otherwise, and the
-source audit pins the guard, the ICMP setting, and the two socket-open sites.
-In the in-memory two-NAT lab
+destination cannot add one (the helper lists exactly one destination name per
+operator, so two destinations are two operators); addresses in reserved,
+private, shared, documentation, benchmarking, multicast, or Tailscale ranges
+are never tracked. At most eight addresses are admitted and sixteen tracked
+(unadmitted ones are evicted first), each is forgotten after 30 minutes
+unobserved, and the pool is cleared on a rebind, network loss, a change of the
+default-route interface or its addresses, or a main-socket report that shares
+no address with it while two destinations agree on a new address (a network
+change under the same interface and local address; one destination answering
+alone cannot reset the pool, and a reset starts an immediate refresh at most
+once a minute). When the main socket's observations of admitted addresses share
+one mapped port and that port either equals the local port or one socket saw
+two admitted addresses with one port, each admitted address is advertised,
+after the main socket's own addresses, as a server-reflexive candidate with the
+current mapped port. To learn the pool quickly, the first refresh on a network
+(and, at most once a minute, any refresh while no round has been answered yet
+or an admitted address has gone 15 minutes unobserved) also runs a learning
+round beside the regular report: three short-lived extra UDP sockets, made
+immune to ICMP-induced read errors like the main sockets, each send a binding
+request, retransmitted at most twice, to every IPv4 destination of the same
+fixed STUN list and are closed within two seconds. Only the public addresses
+they observe are kept; their own ports are never advertised. Their sends go
+through the same allow-list as netcheck and count against the egress tripwire
+otherwise, and the source audit pins the guard, the ICMP setting, and the two
+socket-open sites. In the in-memory two-NAT lab
 (`wgengine/magicsock/directonly_natpool_lab_test.go`: a two-address
 port-preserving pool NAT against a single-address port-preserving host NAT,
 both address-and-port dependent), the fork before pool learning connected in

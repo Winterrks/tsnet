@@ -98,6 +98,10 @@ type directOnlyNATPool struct {
 	learned bool
 	// lastRound is when the latest learning round on this link started.
 	lastRound time.Time
+	// lastResetRefresh is when a reset by resetIfUnrelated last asked for
+	// an immediate refresh. It survives resets, so that resets cannot
+	// trigger refreshes in a loop.
+	lastResetRefresh time.Time
 	// pairs records, with when it was last seen, each pair of distinct
 	// addresses that one socket observed with the same mapped port. A pair
 	// of admitted addresses shows that the NAT keeps a socket's port across
@@ -203,30 +207,47 @@ func (p *directOnlyNATPool) beginRefresh(now time.Time, link string) (generation
 
 // resetIfUnrelated clears the pool when the main socket's report, from the
 // refresh of generation, shares no address with the addresses remembered
-// before that refresh: the network changed without a rebind or a new link
-// fingerprint (for example the same interface and local address behind
-// another NAT). It returns the generation the report belongs to afterwards
-// and whether it reset.
-func (p *directOnlyNATPool) resetIfUnrelated(generation uint64, main []directOnlyPoolObservation, remembered []netip.Addr) (uint64, bool) {
+// before that refresh and two different destinations agree on a new
+// address (the admission rule): the network changed without a rebind or a
+// new link fingerprint (for example the same interface and local address
+// behind another NAT). A single destination answering alone, such as a
+// lying one, cannot reset it. It returns the generation the report belongs
+// to afterwards, whether it reset, and whether the caller should start an
+// immediate refresh to learn the new pool, which is allowed at most once
+// per round interval.
+func (p *directOnlyNATPool) resetIfUnrelated(now time.Time, generation uint64, main []directOnlyPoolObservation, remembered []netip.Addr) (_ uint64, reset, refresh bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if generation != p.generation || len(remembered) == 0 {
-		return p.generation, false
+		return p.generation, false, false
 	}
-	related, observed := false, false
+	reporters := make(map[netip.Addr]map[netip.AddrPort]struct{})
 	for _, observation := range main {
 		addr := observation.mapped.Addr().Unmap()
-		if !directOnlyNATPoolAddress(addr) {
+		if !directOnlyNATPoolAddress(addr) || !observation.destination.IsValid() {
 			continue
 		}
-		observed = true
-		related = related || slices.Contains(remembered, addr)
+		if slices.Contains(remembered, addr) {
+			return p.generation, false, false
+		}
+		if reporters[addr] == nil {
+			reporters[addr] = make(map[netip.AddrPort]struct{})
+		}
+		reporters[addr][observation.destination] = struct{}{}
 	}
-	if !observed || related {
-		return p.generation, false
+	agreed := false
+	for _, destinations := range reporters {
+		agreed = agreed || len(destinations) >= 2
+	}
+	if !agreed {
+		return p.generation, false, false
 	}
 	p.resetLocked(p.link)
-	return p.generation, true
+	if p.lastResetRefresh.IsZero() || now.Sub(p.lastResetRefresh) >= directOnlyPoolRoundInterval {
+		p.lastResetRefresh = now
+		refresh = true
+	}
+	return p.generation, true, refresh
 }
 
 // observe records the responses one socket received, and whether they show
