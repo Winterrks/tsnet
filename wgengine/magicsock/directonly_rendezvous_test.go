@@ -47,10 +47,12 @@ import (
 type directOnlyNATLab struct {
 	t        *testing.T
 	stunAddr netip.AddrPort
-	host     *natlab.Machine
-	remote   *natlab.Machine
-	start    time.Time
-	logf     logger.Logf
+	// stunAddrs, when set, replaces stunAddr as the STUN destination list.
+	stunAddrs []netip.AddrPort
+	host      *natlab.Machine
+	remote    *natlab.Machine
+	start     time.Time
+	logf      logger.Logf
 }
 
 func newDirectOnlyNATLab(t *testing.T) *directOnlyNATLab {
@@ -140,6 +142,10 @@ func (lab *directOnlyNATLab) newPeer(
 	peer := &labPeer{identity: identity, changed: make(chan struct{}, 1)}
 	var registry usermetric.Registry
 	var wireguard atomic.Pointer[device.Device]
+	stunEndpoints := lab.stunAddrs
+	if len(stunEndpoints) == 0 {
+		stunEndpoints = []netip.AddrPort{lab.stunAddr}
+	}
 	conn, err := NewConn(Options{
 		// Mirror wgengine: report WireGuard state and start a handshake
 		// when a direct path validates.
@@ -159,7 +165,7 @@ func (lab *directOnlyNATLab) newPeer(
 			}
 		},
 		DirectOnly:             true,
-		DirectSTUNEndpoints:    []netip.AddrPort{lab.stunAddr},
+		DirectSTUNEndpoints:    stunEndpoints,
 		ForceNodeKey:           identity.node,
 		ForceDiscoKey:          identity.disco,
 		Port:                   port,

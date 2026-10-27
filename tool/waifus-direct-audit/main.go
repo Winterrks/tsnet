@@ -132,6 +132,24 @@ func auditRepository(root string) []error {
 			after:  "c.pconn4.WriteToUDPAddrPort",
 		},
 		{
+			file:   "wgengine/magicsock/directonly_natpool.go",
+			name:   "sendDirectOnlyPoolProbe",
+			before: "!c.directOnlySTUNEndpointAllowed(addr)",
+			after:  "pc.WriteToUDPAddrPort",
+		},
+		{
+			file:   "wgengine/magicsock/directonly_natpool.go",
+			name:   "probeDirectOnlyNATPool",
+			before: "if !c.directOnly",
+			after:  "c.probeDirectOnlyPoolSocket(",
+		},
+		{
+			file:   "wgengine/magicsock/directonly_natpool.go",
+			name:   "probeDirectOnlyPoolSocket",
+			before: "pc.Close()",
+			after:  "c.sendDirectOnlyPoolProbe(pc, stun.Request(txID), destination)",
+		},
+		{
 			file:   "wgengine/magicsock/magicsock.go",
 			name:   "sendAddr",
 			before: "if c.directOnly",
@@ -361,6 +379,7 @@ func auditRepository(root string) []error {
 		return failures
 	}
 	constructorSites := 0
+	listenSites := 0
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
 			continue
@@ -371,9 +390,22 @@ func auditRepository(root string) []error {
 			continue
 		}
 		constructorSites += strings.Count(string(data), "derphttp.NewRegionClient(")
+		listenSites += strings.Count(string(data), "c.listenPacket(")
 	}
 	if constructorSites != 1 {
 		failures = append(failures, fmt.Errorf("DERP client constructor sites = %d, want exactly 1 guarded site", constructorSites))
+	}
+	// The rebinding main sockets and the direct-only NAT pool learning
+	// sockets are the only UDP sockets magicsock opens.
+	if listenSites != 2 {
+		failures = append(failures, fmt.Errorf("magicsock socket open sites = %d, want exactly 2 (bindSocket and the guarded NAT pool probe)", listenSites))
+	}
+	if err := (functionForbids{
+		file:      "wgengine/magicsock/directonly_natpool.go",
+		name:      "probeDirectOnlyPoolSocket",
+		forbidden: []string{"WriteTo", ".Write("},
+	}).run(root); err != nil {
+		failures = append(failures, err)
 	}
 	if err := auditRelayDependencies(root); err != nil {
 		failures = append(failures, err)
@@ -408,6 +440,50 @@ func auditRelayDependencies(root string) error {
 		}
 	}
 	return nil
+}
+
+// functionForbids requires that a function's body never names a sink
+// directly, so that it can reach that sink only through a guarded helper.
+type functionForbids struct {
+	file      string
+	name      string
+	forbidden []string
+}
+
+func (check functionForbids) run(root string) error {
+	body, err := functionBody(root, check.file, check.name)
+	if err != nil {
+		return err
+	}
+	for _, forbidden := range check.forbidden {
+		if strings.Contains(body, forbidden) {
+			return fmt.Errorf("%s:%s names %q directly instead of its guarded helper", check.file, check.name, forbidden)
+		}
+	}
+	return nil
+}
+
+func functionBody(root, file, name string) (string, error) {
+	path := filepath.Join(root, filepath.FromSlash(file))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, path, data, 0)
+	if err != nil {
+		return "", err
+	}
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != name || function.Body == nil {
+			continue
+		}
+		start := fset.Position(function.Body.Pos()).Offset
+		end := fset.Position(function.Body.End()).Offset
+		return string(data[start:end]), nil
+	}
+	return "", fmt.Errorf("%s missing function %s", file, name)
 }
 
 type functionCheck struct {

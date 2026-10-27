@@ -305,6 +305,10 @@ type Conn struct {
 	directOnlyNodeKey   key.NodePrivate
 	directPathUp        func(key.NodePublic) // immutable; nil outside direct-only mode
 
+	// directOnlyNATPool remembers the public IPv4 addresses observed on the
+	// current network in direct-only mode; it is unused otherwise.
+	directOnlyNATPool directOnlyNATPool
+
 	prohibitedDERPAttempts             atomic.Uint64
 	prohibitedPeerRelayAttempts        atomic.Uint64
 	prohibitedEgressAttempts           atomic.Uint64
@@ -1146,6 +1150,19 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 		return new(netcheck.Report), nil
 	}
 
+	// In direct-only mode, a learning round of short-lived extra sockets
+	// runs beside the report to discover the NAT's public address pool.
+	var poolGeneration uint64
+	var poolLearned chan bool
+	if c.directOnly {
+		var learn bool
+		poolGeneration, learn = c.directOnlyNATPool.beginRefresh(time.Now(), c.directOnlyLinkFingerprint())
+		if learn {
+			poolLearned = make(chan bool, 1)
+			go func() { poolLearned <- c.probeDirectOnlyNATPool(ctx, poolGeneration) }()
+		}
+	}
+
 	report, err := c.netChecker.GetReport(ctx, dm, &netcheck.GetReportOpts{
 		// Pass information about the last time that we received a
 		// frame from a DERP server to our netchecker to help avoid
@@ -1160,8 +1177,18 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 		ProbeAllRegions:     c.directOnly,
 		OnlyTCP443:          !c.directOnly && c.onlyTCP443.Load(),
 	})
+	if poolLearned != nil && <-poolLearned {
+		c.directOnlyNATPool.markLearned(poolGeneration)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if c.directOnly {
+		mapped := make([]netip.AddrPort, 0, len(report.GlobalV4Counters))
+		for ap := range report.GlobalV4Counters {
+			mapped = append(mapped, ap)
+		}
+		c.directOnlyNATPool.observe(time.Now(), poolGeneration, mapped)
 	}
 
 	c.lastNetCheckReport.Store(report)
@@ -1465,6 +1492,9 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 	}
 	if c.directOnly {
 		for _, addr := range directOnlyExtraGlobalAddrs(nr) {
+			addAddr(addr, tailcfg.EndpointSTUN)
+		}
+		for _, addr := range c.directOnlyPoolEndpoints(nr) {
 			addAddr(addr, tailcfg.EndpointSTUN)
 		}
 	}
@@ -3013,6 +3043,9 @@ func (c *Conn) SetNetworkUp(up bool) {
 			c.portMapper.NoteNetworkDown()
 		}
 		c.closeAllDerpLocked("network-down")
+		if c.directOnly {
+			c.directOnlyNATPool.reset()
+		}
 	}
 }
 
@@ -4164,6 +4197,10 @@ const (
 // rebind closes and re-binds the UDP sockets.
 // We consider it successful if we manage to bind the IPv4 socket.
 func (c *Conn) rebind(curPortFate currentPortFate) error {
+	if c.directOnly {
+		// A new socket or network gets fresh NAT address choices.
+		c.directOnlyNATPool.reset()
+	}
 	if err := c.bindSocket(&c.pconn6, "udp6", curPortFate); err != nil {
 		c.logf("magicsock: Rebind ignoring IPv6 bind failure: %v", err)
 	}

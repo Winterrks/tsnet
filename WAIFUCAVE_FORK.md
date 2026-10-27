@@ -82,6 +82,32 @@ inconsistent port stay excluded as likely hard-NAT mappings. LAN gateway port
 mapping and validated direct peer candidates remain available for NAT traversal
 and network mobility.
 
+Such a pool NAT's choice is sticky per socket and destination, so the main
+socket can see one address on every STUN destination while its traffic to the
+peer leaves through another, which the peer's address-and-port dependent filter
+then drops. Direct-only magicsock therefore remembers every public IPv4 address
+observed on the current network (at most eight, each forgotten after 30 minutes
+unobserved, and all cleared on a rebind, network loss, or change of the
+default-route interface or its addresses). When the main socket's observations
+share one mapped port and that port either equals the local port or some socket
+on this network saw two pool addresses with one port, each remembered address
+is advertised as a server-reflexive candidate with the current mapped port. To
+learn the pool quickly, the first refresh on a network (and, at most once a
+minute, any refresh while no round has been answered yet or a remembered
+address has gone 15 minutes unobserved) also runs a learning round beside the
+regular report: three short-lived extra UDP sockets each send a binding
+request, retransmitted at most twice, to every IPv4 destination of the same
+fixed STUN list and are closed within two seconds. Only the public addresses
+they observe are kept; their own ports are never advertised. Their sends go
+through the same allow-list as netcheck and count against the egress tripwire
+otherwise, and the source audit pins the guard and the two socket-open sites.
+In the in-memory two-NAT lab
+(`wgengine/magicsock/directonly_natpool_lab_test.go`: a two-address
+port-preserving pool NAT against a single-address port-preserving host NAT,
+both address-and-port dependent), the previous fork connected in only six of
+the eight main-socket assignments and advertised both addresses in four; with
+pool learning every assignment advertises both and connects at once.
+
 While a direct-only instance has an authorized peer, a node key, and an online
 network, its existing randomized 20–26-second STUN refresh remains active during
 application idle. Each periodic refresh also retries authenticated discovery to
