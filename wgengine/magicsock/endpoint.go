@@ -65,7 +65,6 @@ type endpoint struct {
 	// atomically accessed; declared first for alignment reasons
 	lastRecvWG            mono.Time // last time there were incoming packets from this peer destined for wireguard-go (e.g. not disco)
 	lastRecvUDPAny        mono.Time // last time there were incoming UDP packets from this peer of any kind
-	lastRecvHandshake     mono.Time // direct-only: last time a WireGuard handshake message arrived from this peer
 	numStopAndResetAtomic int64
 	debugUpdates          *ringlog.RingLog[EndpointChange]
 
@@ -133,9 +132,11 @@ const (
 	// directOnlyPathUpDelay is how long after the first direct path
 	// validation Conn.directPathUp waits before running. When both peers
 	// validate at once, the side with traffic usually sends a held handshake
-	// within that time; the other side then sees it arrive and skips its own,
-	// avoiding simultaneous initiations that wireguard-go resolves only on
-	// its next retransmission.
+	// within that time; the other side's WireGuard then completes that
+	// handshake and it skips its own, avoiding simultaneous initiations that
+	// wireguard-go resolves only on its next retransmission. Only a
+	// handshake WireGuard authenticated suppresses the hook; a packet that
+	// merely looks like one cannot.
 	directOnlyPathUpDelay = 500 * time.Millisecond
 )
 
@@ -214,8 +215,8 @@ func (de *endpoint) takeHeldDirectOnlyHandshakeLocked(now mono.Time) []byte {
 // processed. When that pong newly validated a direct path (none before, an
 // expired one, or a different address), it sends any held handshake message
 // over the path, and on the first validation for this endpoint it lets the
-// engine start a WireGuard handshake. Both only use the validated direct
-// address; nothing is ever relayed.
+// engine start a WireGuard handshake, which travels over the same validated
+// address. Nothing is ever relayed.
 //
 // de.mu must be held.
 func (de *endpoint) directOnlyPathValidatedLocked(now mono.Time, previous epAddr, wasTrusted bool) {
@@ -243,10 +244,14 @@ func (de *endpoint) directOnlyPathValidatedLocked(now mono.Time, previous epAddr
 		if de.c.connCtx.Err() != nil {
 			return
 		}
-		if received := de.lastRecvHandshake.LoadAtomic(); !received.IsZero() &&
-			mono.Since(received) < directOnlyHandshakeHoldTime {
-			// The peer is already handshaking with us.
-			return
+		if getPeer := de.c.getPeerByKey; getPeer != nil {
+			if peer, ok := getPeer(de.publicKey); ok && peer.IsValid() {
+				if last := peer.LastHandshake(); !last.IsZero() &&
+					time.Since(last) < directOnlyHandshakeHoldTime+directOnlyPathUpDelay {
+					// WireGuard already completed a fresh handshake.
+					return
+				}
+			}
 		}
 		pathUp(de.publicKey)
 	})

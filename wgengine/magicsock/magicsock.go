@@ -568,11 +568,13 @@ type Options struct {
 	ForceNodeKey key.NodePrivate
 
 	// DirectPathUpFunc, if non-nil, is called (in its own goroutine) at
-	// most once per peer endpoint in DirectOnly mode, the first time a disco
-	// pong validates a direct path to that peer. The engine uses it to start
-	// a WireGuard handshake immediately, so a peer whose process restarted
-	// replaces stale session keys without waiting for the keepalive
-	// timeout. It is ignored outside DirectOnly mode.
+	// most once per peer endpoint in DirectOnly mode, shortly after a disco
+	// pong first validates a direct path to that peer, unless a held
+	// handshake message was just sent or WireGuard (per PeerByKeyFunc)
+	// completed a handshake with the peer in the meantime. The engine uses it
+	// to start a WireGuard handshake immediately, so a peer whose process
+	// restarted replaces stale session keys without waiting for the
+	// keepalive timeout. It is ignored outside DirectOnly mode.
 	DirectPathUpFunc func(key.NodePublic)
 
 	// OnDERPRecv, if non-nil, is called for every non-disco packet
@@ -2182,9 +2184,6 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
 	}
 	now := mono.Now()
 	ep.lastRecvUDPAny.StoreAtomic(now)
-	if c.directOnly && looksLikeHandshakeMsg(b) {
-		ep.lastRecvHandshake.StoreAtomic(now)
-	}
 	connNoted := ep.noteRecvActivity(src, now)
 	if buildfeatures.HasNetLog {
 		if update := c.connCounter.Load(); update != nil {
@@ -4785,9 +4784,6 @@ func (le *lazyEndpoint) InitiationMessagePublicKey(peerPublicKey [32]byte) {
 	}
 	now := mono.Now()
 	ep.lastRecvUDPAny.StoreAtomic(now)
-	if le.c.directOnly {
-		ep.lastRecvHandshake.StoreAtomic(now)
-	}
 	ep.noteRecvActivity(le.src, now)
 }
 

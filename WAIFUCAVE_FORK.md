@@ -102,12 +102,19 @@ never transport data, at most five seconds old) and sends it over the direct
 address as soon as a disco pong validates one, instead of leaving it to
 wireguard-go's five-second retransmission. The first time a direct path to a
 peer validates, the engine also starts a WireGuard handshake through the new
-`magicsock.Options.DirectPathUpFunc` hook, unless a handshake is already in
-flight in either direction; a peer that restarted therefore replaces stale
-session keys immediately instead of after wireguard-go's 15-second keepalive
-timeout. All three only ever send to a direct address validated by a disco
-pong. `wgengine/magicsock/directonly_rendezvous_test.go` measures the effect on
-an in-memory two-NAT topology (endpoint-independent mapping, address-and-port
+`magicsock.Options.DirectPathUpFunc` hook, unless a held handshake was just
+sent or WireGuard itself completed a handshake with the peer meanwhile (a
+packet that merely looks like a handshake cannot suppress it), and only while
+the embedding runtime still authorizes the peer
+(`wgengine.Config.DirectOnlyPeerAuthorized`), so a peer whose revocation is
+draining never receives a new initiation. A peer that restarted therefore
+replaces stale session keys immediately instead of after wireguard-go's
+15-second keepalive timeout. The rendezvous answer goes to the source address
+of a ping that authenticated with the authorized peer's discovery key; the
+held handshake and the path-up handshake go only to a direct address that a
+disco pong validated. None of them uses DERP, a relay, or any other path.
+`wgengine/magicsock/directonly_rendezvous_test.go` measures the effect on an
+in-memory two-NAT topology (endpoint-independent mapping, address-and-port
 dependent filtering, no DERP):
 
 | case (coordination delay) | before | after |
@@ -139,7 +146,9 @@ The intentionally added public seams are:
   `ipnlocal.WithWaifusLocalIdentity`, which are construction-only backend
   options.
 - `magicsock.Options.DirectPathUpFunc`, the direct-only first-path handshake
-  hook the engine installs; it is ignored outside direct-only mode.
+  hook the engine installs, and `wgengine.Config.DirectOnlyPeerAuthorized`,
+  which tsnet sets from the pair authorizer; both are ignored outside
+  direct-only mode, and without an authorizer no such handshake starts.
 - `wgengine.Config.DirectOnly`, its fixed STUN list/node/discovery identity
   fields, `magicsock.MaxDirectSTUNEndpoints`,
   `magicsock.ValidDirectOnlySTUNEndpoints`, and

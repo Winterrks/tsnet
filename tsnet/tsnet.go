@@ -156,6 +156,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tailscale/wireguard-go/tun"
@@ -462,6 +463,9 @@ type Server struct {
 	logbuffer           *filch.Filch
 	logtail             *logtail.Logger
 	logid               logid.PublicID
+	// waifusBackend publishes lb to the direct-only engine's authorization
+	// check, which may run from network goroutines.
+	waifusBackend atomic.Pointer[ipnlocal.LocalBackend]
 
 	mu                  sync.Mutex
 	listeners           map[listenKey]*listener
@@ -1280,7 +1284,7 @@ func (s *Server) start() (reterr error) {
 		forceNodeKey = s.waifusControl.nodePrivateKey
 		forceDiscoKey = s.waifusControl.discoPrivateKey
 	}
-	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
+	engineConfig := wgengine.Config{
 		DirectOnly:          s.waifusControl != nil,
 		DirectSTUNEndpoints: directSTUNEndpoints,
 		ForceNodeKey:        forceNodeKey,
@@ -1295,7 +1299,20 @@ func (s *Server) start() (reterr error) {
 		HealthTracker:       sys.HealthTracker.Get(),
 		ExtraRootCAs:        sys.ExtraRootCAs,
 		Metrics:             sys.UserMetricsRegistry(),
-	})
+	}
+	if s.waifusControl != nil {
+		// The backend's view applies local pair revocation immediately,
+		// before the revoked peer finishes draining.
+		engineConfig.DirectOnlyPeerAuthorized = func(peerKey key.NodePublic) bool {
+			lb := s.waifusBackend.Load()
+			if lb == nil {
+				return false
+			}
+			_, ok := lb.WaifusPeerAddress(peerKey)
+			return ok
+		}
+	}
+	eng, err := wgengine.NewUserspaceEngine(tsLogf, engineConfig)
 	if err != nil {
 		return err
 	}
@@ -1400,6 +1417,7 @@ func (s *Server) start() (reterr error) {
 	lb.SetVarRoot(s.rootPath)
 	s.logf("tsnet starting with hostname %q, varRoot %q", s.hostname, s.rootPath)
 	s.lb = lb
+	s.waifusBackend.Store(lb)
 	if err := ns.Start(lb); err != nil {
 		return fmt.Errorf("failed to start netstack: %w", err)
 	}

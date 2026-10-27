@@ -89,6 +89,9 @@ type userspaceEngine struct {
 	netMonOwned       bool                // whether we created netMon (and thus need to close it)
 	controlKnobs      *controlknobs.Knobs // or nil
 	directOnlyNodeKey key.NodePrivate
+	// directOnlyPeerAuthorized is immutable after construction; see
+	// Config.DirectOnlyPeerAuthorized.
+	directOnlyPeerAuthorized func(key.NodePublic) bool
 
 	// bird is the BIRD integration handle constructed via
 	// [HookNewBird], or nil if [Config.BIRDSocket] was empty or the
@@ -176,6 +179,13 @@ type Config struct {
 	// passed to magicsock when DirectOnly is selected. magicsock validates
 	// and copies it.
 	DirectSTUNEndpoints []netip.AddrPort
+
+	// DirectOnlyPeerAuthorized reports whether a peer is currently
+	// authorized by the embedding direct-only runtime. The first-path
+	// handshake is started only for authorized peers, so a peer whose
+	// revocation is draining never receives a new initiation. When nil, no
+	// such handshake is started.
+	DirectOnlyPeerAuthorized func(key.NodePublic) bool
 
 	// ForceNodeKey is the helper-owned WireGuard identity accepted by a
 	// DirectOnly engine. Reconfig may temporarily clear the key to stop the
@@ -447,6 +457,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	}
 	var directPathUp func(key.NodePublic)
 	if conf.DirectOnly {
+		e.directOnlyPeerAuthorized = conf.DirectOnlyPeerAuthorized
 		directPathUp = e.startDirectOnlyHandshake
 	}
 	magicsockOpts := magicsock.Options{
@@ -1034,6 +1045,10 @@ var ErrEngineClosing = errors.New("engine closing; no status")
 // and a fresh process would wait for its next handshake retransmission. The
 // handshake travels only over the validated direct path.
 func (e *userspaceEngine) startDirectOnlyHandshake(peerKey key.NodePublic) {
+	authorized := e.directOnlyPeerAuthorized
+	if authorized == nil || !authorized(peerKey) {
+		return
+	}
 	wgDevice := e.wgdev
 	if wgDevice == nil {
 		return

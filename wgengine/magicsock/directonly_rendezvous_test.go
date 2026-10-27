@@ -22,6 +22,7 @@ import (
 	"tailscale.com/disco"
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/stun"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
@@ -34,6 +35,7 @@ import (
 	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/wgcfg"
+	"tailscale.com/wgengine/wgint"
 	"tailscale.com/wgengine/wglog"
 )
 
@@ -139,7 +141,16 @@ func (lab *directOnlyNATLab) newPeer(
 	var registry usermetric.Registry
 	var wireguard atomic.Pointer[device.Device]
 	conn, err := NewConn(Options{
-		// Mirror wgengine: start a handshake when a direct path validates.
+		// Mirror wgengine: report WireGuard state and start a handshake
+		// when a direct path validates.
+		PeerByKeyFunc: func(peerKey key.NodePublic) (wgint.Peer, bool) {
+			if dev := wireguard.Load(); dev != nil {
+				if wgPeer, ok := dev.LookupActivePeer(peerKey.Raw32()); ok {
+					return wgint.PeerOf(wgPeer), true
+				}
+			}
+			return wgint.Peer{}, false
+		},
 		DirectPathUpFunc: func(peerKey key.NodePublic) {
 			if dev := wireguard.Load(); dev != nil {
 				if wgPeer := dev.LookupPeer(peerKey.Raw32()); wgPeer != nil {
@@ -680,14 +691,20 @@ func TestDirectOnlyPathUpStartsOneHandshake(t *testing.T) {
 		case <-time.After(3 * directOnlyPathUpDelay):
 		}
 	})
-	t.Run("peer-already-handshaking", func(t *testing.T) {
+	t.Run("lookalike-handshake-does-not-suppress", func(t *testing.T) {
+		// Only WireGuard-authenticated handshake state may suppress the
+		// hook. A packet that merely has a handshake's type and length,
+		// from the peer's own address, must not.
 		ep, address, calls := newConn(t)
-		ep.lastRecvHandshake.StoreAtomic(mono.Now())
+		forged := wireGuardTestMessage(device.MessageInitiationType, device.MessageInitiationSize)
+		if _, _, _, ok := ep.c.receiveIP(forged, address, &epAddrEndpointCache{}); !ok {
+			t.Fatal("test packet was not accepted for WireGuard")
+		}
 		validate(ep, address)
 		select {
 		case <-calls:
-			t.Fatal("started a handshake while the peer's was arriving")
-		case <-time.After(3 * directOnlyPathUpDelay):
+		case <-time.After(5 * directOnlyPathUpDelay):
+			t.Fatal("a forged handshake lookalike suppressed the path-up handshake")
 		}
 	})
 	t.Run("held-handshake-sent", func(t *testing.T) {
@@ -718,5 +735,100 @@ func TestDirectPathUpFuncIgnoredOutsideDirectOnly(t *testing.T) {
 	defer c.Close()
 	if c.directPathUp != nil {
 		t.Fatal("path-up hook installed outside direct-only mode")
+	}
+}
+
+// TestDirectOnlyRendezvousAnswerThroughAuthenticatedPing drives a sealed disco
+// ping from the authorized peer's key through the real receive path, from a
+// source the map never advertised, and checks that the answer is a ping to
+// exactly that source. The answer goes to the source of an authenticated
+// ping, not to a pong-validated path; the pong it elicits is what validates.
+func TestDirectOnlyRendezvousAnswerThroughAuthenticatedPing(t *testing.T) {
+	sink, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sink.Close() })
+	c, err := NewConn(directOnlyTestOptions(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	if _, _, err := c.bind.Open(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetPrivateKey(c.directOnlyNodeKey); err != nil {
+		t.Fatal(err)
+	}
+	peerDisco := key.NewDisco()
+	self := directOnlyTestNode(1, 0, false, "100.64.0.1/32")
+	peerNode := directOnlyTestNode(2, 0, false, "100.64.0.2/32").AsStruct()
+	peerNode.DiscoKey = peerDisco.Public()
+	peerNode.Endpoints = nil
+	if err := c.SetNetworkMap(self, []tailcfg.NodeView{peerNode.View()}); err != nil {
+		t.Fatal(err)
+	}
+	shared := peerDisco.Shared(c.DiscoPublicKey())
+	seal := func(message disco.Message) []byte {
+		packet := append([]byte(disco.Magic), peerDisco.Public().AppendTo(nil)...)
+		return append(packet, shared.Seal(message.AppendMarshal(nil))...)
+	}
+	source := sink.LocalAddr().(*net.UDPAddr).AddrPort()
+	readMessages := func(wait time.Duration) []disco.Message {
+		var messages []disco.Message
+		buffer := make([]byte, 2048)
+		for {
+			sink.SetReadDeadline(time.Now().Add(wait))
+			n, _, err := sink.ReadFromUDPAddrPort(buffer)
+			if err != nil {
+				return messages
+			}
+			packet := buffer[:n]
+			if !bytes.HasPrefix(packet, []byte(disco.Magic)) || len(packet) < discoHeaderLen {
+				t.Fatalf("non-disco packet %x sent to the pinging source", packet)
+			}
+			clear, ok := shared.Open(packet[discoHeaderLen:])
+			if !ok {
+				t.Fatal("reply was not sealed to the pinging peer")
+			}
+			message, err := disco.Parse(clear)
+			if err != nil {
+				t.Fatal(err)
+			}
+			messages = append(messages, message)
+		}
+	}
+	countPings := func(messages []disco.Message) (pings, pongs int) {
+		for _, message := range messages {
+			switch message.(type) {
+			case *disco.Ping:
+				pings++
+			case *disco.Pong:
+				pongs++
+			}
+		}
+		return pings, pongs
+	}
+
+	// A forged ping (not sealed with the peer's key) gets nothing back.
+	forged := append([]byte(disco.Magic), peerDisco.Public().AppendTo(nil)...)
+	forged = append(forged, make([]byte, 64)...)
+	c.handleDiscoMessage(forged, epAddr{ap: source}, false, key.NodePublic{}, discoRXPathUDP)
+	if messages := readMessages(200 * time.Millisecond); len(messages) != 0 {
+		t.Fatalf("unauthenticated ping elicited %d messages", len(messages))
+	}
+
+	c.handleDiscoMessage(seal(&disco.Ping{TxID: stun.NewTxID()}), epAddr{ap: source}, false, key.NodePublic{}, discoRXPathUDP)
+	pings, pongs := countPings(readMessages(500 * time.Millisecond))
+	if pongs != 1 || pings == 0 {
+		t.Fatalf("authenticated ping from a new source got %d pongs and %d pings, want a pong and a rendezvous ping", pongs, pings)
+	}
+	// A second ping within the answer interval gets only its pong.
+	c.handleDiscoMessage(seal(&disco.Ping{TxID: stun.NewTxID()}), epAddr{ap: source}, false, key.NodePublic{}, discoRXPathUDP)
+	if pings, pongs := countPings(readMessages(300 * time.Millisecond)); pongs != 1 || pings != 0 {
+		t.Fatalf("repeated ping got %d pongs and %d pings, want only a pong", pongs, pings)
+	}
+	if counters := c.DirectOnlyCounters(); counters != (DirectOnlyCounters{}) {
+		t.Fatalf("forbidden transport attempted: %+v", counters)
 	}
 }
